@@ -1,0 +1,11 @@
+.idea/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+.coverage
+coverage.xml
+__pycache__/
+*.py[cod]
