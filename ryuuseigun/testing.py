@@ -7,9 +7,9 @@ from ryuuseigun.headers import Headers
 from dataclasses import field, dataclass
 from ryuuseigun.types import ASGIMessage
 from ryuuseigun._tasks import cancel_and_join
+from ryuuseigun._lifespan import LifespanSession
 from urllib.request import Request as CookieRequest
 from ryuuseigun.websocket import WebSocketDisconnect
-from ryuuseigun._testing_lifespan import LifespanSession
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any, Self, Unpack, Optional, TypedDict
 from asyncio import Task, Event, Queue, timeout, create_task
@@ -40,7 +40,6 @@ class RequestOptions(TypedDict, total=False):
     http_version: str
     extensions: Mapping[str, Any] | None
 
-
 def _url_scope(path: str, query: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
     split = urlsplit(path)
     query_string = split.query if query is None else urlencode(query)
@@ -49,7 +48,6 @@ def _url_scope(path: str, query: Optional[Mapping[str, str]] = None) -> dict[str
         'raw_path': quote(split.path or '/', safe="/%:@!$&'()*+,;=-._~").encode('ascii'),
         'query_string': quote(query_string, safe="%=&+/:;?@!$'()*,-._~").encode('ascii'),
     }
-
 
 @dataclass(slots=True)
 class TestResponse:
@@ -67,7 +65,6 @@ class TestResponse:
 
     def json(self) -> Any:
         return loads(self.body)
-
 
 class TestClient[StateT = Any]:
     def __init__(
@@ -317,13 +314,11 @@ class TestClient[StateT = Any]:
         self._websockets.append(session)
         return session
 
-
 class WebSocketUpgradeError(Exception):
     def __init__(self, status_code: int, body: bytes) -> None:
         self.status_code = status_code
         self.body = body
         super().__init__(f'WebSocket upgrade rejected with status {status_code}')
-
 
 class WebSocketTestSession:
     def __init__(

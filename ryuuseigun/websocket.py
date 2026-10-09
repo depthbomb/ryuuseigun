@@ -2,8 +2,10 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from ryuuseigun.headers import Headers
 from inspect import Parameter, signature
+from ryuuseigun.metadata import RouteInfo
 from ryuuseigun.request import QueryParams
 from orjson import dumps, loads, JSONDecodeError
+from ryuuseigun._paths import root_path, route_path
 from typing import Any, TypeVar, Optional, TypeAlias
 from ryuuseigun.routing import Converter, normalize_path
 from collections.abc import Callable, Sequence, Awaitable
@@ -17,13 +19,11 @@ WebSocketInvoker: TypeAlias = Callable[['WebSocket', dict[str, Any]], Awaitable[
 WebSocketNext: TypeAlias = Callable[['WebSocket'], Awaitable[None]]
 WebSocketMiddleware: TypeAlias = Callable[['WebSocket', WebSocketNext], Awaitable[None]]
 
-
 class WebSocketDisconnect(Exception):
     def __init__(self, code: int = WebSocketCloseCode.NORMAL, reason: str = '') -> None:
         self.code = code
         self.reason = reason
         super().__init__(f'WebSocket disconnected with code {code}: {reason}')
-
 
 class WebSocket:
     __slots__ = (
@@ -34,6 +34,7 @@ class WebSocket:
         '_json_options',
         '_receive',
         '_send',
+        '_route_info',
         'headers',
         'path',
         'path_params',
@@ -59,7 +60,8 @@ class WebSocket:
         self._connected = False
         self._json_options = json_options
         self._default_response_headers = default_response_headers
-        self.path = str(scope.get('path', '/'))
+        self.path = route_path(scope)
+        self._route_info: RouteInfo | None = None
         self.headers = Headers.from_raw(scope.get('headers', []))
         self.query = QueryParams(scope.get('query_string', b''))
         self.path_params: dict[str, Any] = {}
@@ -68,6 +70,15 @@ class WebSocket:
     @property
     def accepted(self) -> bool:
         return self._accepted
+
+    @property
+    def route(self) -> RouteInfo | None:
+        """Selected WebSocket route, available before socket middleware enters."""
+        return self._route_info
+
+    @property
+    def root_path(self) -> str:
+        return root_path(self.scope)
 
     @property
     def closed(self) -> bool:
@@ -213,7 +224,6 @@ class WebSocket:
         if self._closed:
             raise RuntimeError('WebSocket is closed')
 
-
 @dataclass(slots=True, frozen=True)
 class WebSocketRoute:
     path: str
@@ -224,7 +234,6 @@ class WebSocketRoute:
     param_names: tuple[str, ...]
     middlewares: tuple[WebSocketMiddleware, ...]
     module_chain: tuple[Any, ...] = ()
-
 
 class WebSocketRouter:
     def __init__(self, *, strict_slashes: bool = False) -> None:
@@ -267,7 +276,6 @@ class WebSocketRouter:
                 return route, params
         return None, {}
 
-
 def build_websocket_invoker(handler: WebSocketHandler, param_names: Sequence[str]) -> WebSocketInvoker:
     require_async(handler, 'WebSocket handler')
     parameters = list(signature(handler).parameters.values())
@@ -287,19 +295,15 @@ def build_websocket_invoker(handler: WebSocketHandler, param_names: Sequence[str
 
     return invoke
 
-
 def validate_websocket_middleware(middleware: WebSocketMiddleware) -> None:
     validate_middleware(middleware, 'WebSocket middleware')
-
 
 def _route_pattern(segments: Sequence[str | Converter]) -> tuple[tuple[bool, str], ...]:
     return tuple((isinstance(segment, str), segment if isinstance(segment, str) else segment.name) for segment in segments)
 
-
 def _route_priority(route: WebSocketRoute) -> tuple[int, ...]:
     priorities = {'int': 4, 'float': 3, 'uuid': 2, 'string': 1, 'path': 0}
     return tuple(5 if isinstance(segment, str) else priorities[segment.name] for segment in route.segments)
-
 
 def _match_segments(route: WebSocketRoute, values: list[str]) -> Optional[dict[str, Any]]:
     converted: list[Any] = []

@@ -1,18 +1,24 @@
+from math import isfinite
 from logging import getLogger
 from dataclasses import replace
 from ipaddress import IPv6Address
 from types import SimpleNamespace
 from ryuuseigun.module import Module
+from ryuuseigun._mounting import Mount
 from ryuuseigun.headers import Headers
 from inspect import iscoroutinefunction
+from ryuuseigun.metadata import RouteInfo
 from traceback import format_exception_only
+from ryuuseigun.types import ASGIApplication
 from ryuuseigun.exceptions import HTTPException
+from ryuuseigun._lifespan import LifespanSession
 from urllib.parse import quote, quote_from_bytes
 from ryuuseigun._registration import Registration
 from ryuuseigun.types import Send, Receive, ASGIScope
 from typing import Any, Optional, overload, TYPE_CHECKING
 from ryuuseigun.middleware import Next, MiddlewareCallable
 from contextlib import AsyncExitStack, AbstractAsyncContextManager
+from ryuuseigun._paths import route_path, mounted_scope, prefixed_path
 from collections.abc import Mapping, Callable, Iterable, Sequence, Awaitable
 from ryuuseigun.handlers import AfterHandler, BeforeHandler, validate_middleware
 from ryuuseigun.config import Config, MultipartOverrides, resolve_multipart_limits
@@ -52,7 +58,6 @@ from ryuuseigun.websocket import (
     validate_websocket_middleware,
 )
 
-
 if TYPE_CHECKING:
     from ryuuseigun.testing import TestClient
 
@@ -87,15 +92,12 @@ def _normalize_host(value: str) -> str:
         return ''
     return value
 
-
 def _valid_port(value: str) -> bool:
     return value.isascii() and value.isdecimal() and len(value) <= 5 and int(value) <= 65535
-
 
 def _redirect_location(path: str, query: bytes) -> str:
     location = quote(path, safe='/')
     return location if not query else f'{location}?{quote_from_bytes(query, safe="!$&\'()*+,-./:;=?@_%~")}'
-
 
 def _host_is_trusted(value: str, trusted_hosts: tuple[str, ...]) -> bool:
     host = _normalize_host(value)
@@ -112,12 +114,10 @@ def _host_is_trusted(value: str, trusted_hosts: tuple[str, ...]) -> bool:
             return True
     return False
 
-
 def _route_endpoint(endpoint: Optional[str], name: Optional[str]) -> Optional[str]:
     if endpoint is not None and name is not None and endpoint != name:
         raise ValueError('Route endpoint and name must match when both are provided')
     return name if name is not None else endpoint
-
 
 class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
     @overload
@@ -188,6 +188,75 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
         ] = []
         self.state = SimpleNamespace()
         self._finalizers: list[Callable[[], None]] = []
+        self._mounts: list[Mount] = []
+        self._mount_lifespans: dict[int, LifespanSession] = {}
+        self._route_info: dict[int, RouteInfo] = {}
+
+    @property
+    def mounts(self) -> tuple[Mount, ...]:
+        return tuple(self._mounts)
+
+    def mount(
+        self, path: str, app: ASGIApplication, *, name: str,
+        lifespan: bool = False, lifespan_timeout: float = 10,
+    ) -> None:
+        """Delegate a prefix to an independent app, using the longest matching prefix.
+
+        Mounts own their prefixes before native route matching. Native hooks belong
+        to each app; shared policies go in outer ASGI middleware. Child lifespans
+        are opt-in, start after parent resource contexts, and unwind in reverse.
+        url_for('name:route', ...) reverses a child's named route; use
+        url_for('name', path='/file') for an arbitrary ASGI application.
+        """
+        self._ensure_mutable()
+        if not path.startswith('/') or any(char in path for char in '?#<>'):
+            raise ValueError('Mount paths must be literal absolute paths')
+        prefix = path.rstrip('/')
+        if not name or ':' in name or any(item.name == name or item.path == prefix for item in self._mounts):
+            raise ValueError('Mount names and paths must be unique; names cannot contain a colon')
+        if not callable(app):
+            raise TypeError('Mounted applications must be ASGI callables')
+        if not isfinite(lifespan_timeout) or lifespan_timeout <= 0:
+            raise ValueError('lifespan_timeout must be finite and positive')
+        if app is self or isinstance(app, Ryuuseigun) and app._contains_app(self):
+            raise ValueError('Cyclic application mounting')
+        self._mounts.append(Mount(prefix, app, name, lifespan, lifespan_timeout))
+
+    def _contains_app(self, app: ASGIApplication) -> bool:
+        return any(
+            mount.app is app or isinstance(mount.app, Ryuuseigun) and mount.app._contains_app(app)
+            for mount in self._mounts
+        )
+
+    def inspect_routes(self) -> tuple[RouteInfo, ...]:
+        """Finalize registration and return immutable HTTP/WebSocket pipeline descriptions."""
+        self.finalize()
+        return tuple(self._route_info.values())
+
+    async def _dispatch_mount(self, scope: ASGIScope, receive: Receive, send: Send) -> bool:
+        path = route_path(scope)
+        for mount in sorted(self._mounts, key=lambda item: len(item.path), reverse=True):
+            if mount.path and path != mount.path and not path.startswith(mount.path + '/'):
+                continue
+            if self._config.trusted_hosts:
+                try:
+                    self._validate_host(Headers.from_raw(scope.get('headers', [])))
+                except HTTPException as error:
+                    if scope['type'] == ASGIScopeType.WEBSOCKET:
+                        await self._create_websocket(scope, receive, send).reject(error.status_code)
+                    else:
+                        response = self._make_error_response(error.status_code, error.detail, error.headers)
+                        self._apply_default_response_headers(response)
+                        await response.send(send, scope=scope, receive=receive, head=scope.get('method') == 'HEAD')
+                    return True
+            child = mounted_scope(scope, mount.path)
+            session = self._mount_lifespans.get(id(mount.app))
+            if session is not None:
+                child['state'] = dict(session.state)
+            await mount.app(child, receive, send)
+            return True
+
+        return False
 
     @property
     def routes(self) -> tuple[Route, ...]:
@@ -221,6 +290,9 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
         if not self._frozen:
             self.finalize()
         scope_type = scope.get('type')
+        if self._mounts and scope_type in {ASGIScopeType.HTTP, ASGIScopeType.WEBSOCKET}:
+            if await self._dispatch_mount(scope, receive, send):
+                return
         if scope_type == ASGIScopeType.LIFESPAN:
             await self._lifespan(receive, send)
             return
@@ -276,6 +348,10 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
             scope_route = match.route or match.scope_route
             module_chain = scope_route.module_chain if scope_route is not None else ()
             request._route_context = (match, module_chain)
+            if scope_route is not None:
+                request._route_info = self._route_info[id(scope_route)]
+                scope['route'] = request.route
+                scope['endpoint'] = scope_route.handler
             request.path_params = match.params
             if scope_route is not None:
                 request._multipart_limits = scope_route.multipart_limits
@@ -348,6 +424,22 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
         self._url_routes[route.endpoint] = route
 
     def url_for(self, endpoint: str, **values: Any) -> str:
+        mount_name, separator, child_name = endpoint.partition(':')
+        for mount in self._mounts:
+            if mount.name != mount_name:
+                continue
+            if separator:
+                builder = getattr(mount.app, 'url_for', None)
+                if not callable(builder):
+                    raise ValueError('This mounted application does not expose url_for')
+                child_path = builder(child_name, **values)
+            else:
+                child_path = values.pop('path', '/')
+                if values:
+                    raise ValueError('Mount URL building only accepts path')
+            if not isinstance(child_path, str) or not child_path.startswith('/') or child_path.startswith('//'):
+                raise ValueError('Mounted URLs must be application-relative absolute paths')
+            return quote(mount.path, safe='/') + child_path
         route = self._url_routes.get(endpoint)
         if route is None:
             raise KeyError(f'Unknown endpoint: {endpoint}')
@@ -432,6 +524,22 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
             return
         for finalizer in self._finalizers:
             finalizer()
+        described_routes: tuple[Route | WebSocketRoute, ...] = (*self._routes, *self._websocket_routes)
+        for described_route in described_routes:
+            protocol = 'http' if isinstance(described_route, Route) else 'websocket'
+            ordered_middleware: list[Callable[..., Awaitable[Any]]] = list(
+                self.middlewares if protocol == 'http' else self.websocket_middlewares
+            )
+            for module in described_route.module_chain:
+                ordered_middleware.extend(module.middlewares if protocol == 'http' else module.websocket_middlewares)
+            ordered_middleware.extend(described_route.middlewares)
+            self._route_info[id(described_route)] = RouteInfo(
+                described_route.path, described_route.endpoint,
+                described_route.methods if isinstance(described_route, Route) else frozenset(),
+                tuple(module.name for module in described_route.module_chain),
+                tuple(getattr(item, '__qualname__', type(item).__qualname__) for item in ordered_middleware),
+                protocol,
+            )
         self._fallback_pipeline = self._compile_pipeline(None)
         pipelines: dict[_PipelineKey, Next[RequestStateT]] = {((), ()): self._fallback_pipeline}
         for route in self._routes:
@@ -786,7 +894,7 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
         if alternate.route is None and not alternate.allowed_methods:
             return None
         query_string = self._scope_query_string(request.scope)
-        location = _redirect_location(redirect_path, query_string)
+        location = prefixed_path(request.scope, _redirect_location(redirect_path, query_string))
         return Response(status_code=StatusCode.PERMANENT_REDIRECT, headers={HeaderName.LOCATION: location})
 
     @staticmethod
@@ -870,6 +978,9 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
             return
 
         socket.path_params = params
+        socket._route_info = self._route_info[id(route)]
+        scope['route'] = socket.route
+        scope['endpoint'] = route.handler
 
         try:
             await self._websocket_pipelines[id(route)](socket)
@@ -941,7 +1052,7 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
         if route is None:
             return None
         query_string = self._scope_query_string(socket.scope)
-        return _redirect_location(redirect_path, query_string)
+        return prefixed_path(socket.scope, _redirect_location(redirect_path, query_string))
 
     def _create_websocket_route(
         self,
@@ -1027,6 +1138,13 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
                     try:
                         for factory in self._lifespan_factories:
                             await stack.enter_async_context(factory(self))
+                        for mount in self._mounts:
+                            if mount.lifespan and id(mount.app) not in self._mount_lifespans:
+                                session = LifespanSession(mount.app, mount.lifespan_timeout)
+                                await session.start()
+                                self._mount_lifespans[id(mount.app)] = session
+                                stack.callback(self._mount_lifespans.pop, id(mount.app), None)
+                                stack.push_async_callback(session.stop)
                         for handler in self._startup_handlers:
                             await handler()
                     except Exception as error:

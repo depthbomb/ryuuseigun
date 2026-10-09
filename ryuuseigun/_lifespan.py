@@ -1,29 +1,26 @@
-from weakref import WeakSet
-from typing import Any, TYPE_CHECKING
-from ryuuseigun.types import ASGIMessage
+from typing import Any
 from ryuuseigun._tasks import cancel_and_join
+from ryuuseigun.types import ASGIMessage, ASGIApplication
 from asyncio import Task, wait, Queue, timeout, create_task, FIRST_COMPLETED
 
-if TYPE_CHECKING:
-    from ryuuseigun.app import Ryuuseigun
-
-_owners: WeakSet['Ryuuseigun[Any]'] = WeakSet()
+_owners: set[int] = set()
 
 class LifespanSession:
-    def __init__(self, app: 'Ryuuseigun[Any]', timeout_seconds: float) -> None:
+    def __init__(self, app: ASGIApplication, timeout_seconds: float) -> None:
         self.app = app
         self.timeout = timeout_seconds
         self.incoming: Queue[ASGIMessage] = Queue()
         self.outgoing: Queue[ASGIMessage] = Queue()
         self.task: Task[None] | None = None
+        self.state: dict[str, Any] = {}
 
     async def start(self) -> None:
-        if self.app in _owners:
+        if id(self.app) in _owners:
             raise RuntimeError('This application already has an active test-client lifespan')
-        _owners.add(self.app)
+        _owners.add(id(self.app))
         try:
             self.task = create_task(self.app(
-                {'type': 'lifespan', 'asgi': {'version': '3.0', 'spec_version': '2.0'}, 'state': {}},
+                {'type': 'lifespan', 'asgi': {'version': '3.0', 'spec_version': '2.0'}, 'state': self.state},
                 self.incoming.get, self.outgoing.put,
             ))
             await self._exchange('startup')
@@ -45,7 +42,7 @@ class LifespanSession:
             if self.task is not None:
                 await cancel_and_join(self.task)
         finally:
-            _owners.discard(self.app)
+            _owners.discard(id(self.app))
 
     async def _exchange(self, phase: str) -> None:
         if self.task is None:

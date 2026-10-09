@@ -9,6 +9,7 @@ from ryuuseigun.headers import Headers
 from re import sub, compile, IGNORECASE
 from contextvars import Token, ContextVar
 from orjson import loads, JSONDecodeError
+from ryuuseigun.metadata import RouteInfo
 from tempfile import SpooledTemporaryFile
 from asyncio import Lock, sleep, to_thread
 from ryuuseigun.config import MultipartLimits
@@ -17,6 +18,7 @@ from email.policy import default as email_policy
 from typing import IO, Any, Optional, TYPE_CHECKING
 from email.headerregistry import BaseHeader, HeaderRegistry
 from ryuuseigun.exceptions import HTTPException, ClientDisconnect
+from ryuuseigun._paths import root_path, route_path, prefixed_path
 from ryuuseigun.types import Send, Receive, ASGIScope, JSONValue, ASGIMessage
 from collections.abc import Mapping, Callable, Sequence, Awaitable, AsyncIterator
 from ryuuseigun.constants import MediaType, HeaderName, StatusCode, ASGIMessageType
@@ -79,7 +81,6 @@ def validate_query_string(
     if max_parameters is not None and parameter_count > max_parameters:
         raise HTTPException(StatusCode.URI_TOO_LONG, 'Too many query parameters')
 
-
 class QueryParams:
     __slots__ = ('_items', '_value')
 
@@ -114,7 +115,6 @@ class QueryParams:
 
     def items(self) -> list[tuple[str, str]]:
         return list(self._parse())
-
 
 class UploadFile:
     __slots__ = ('_closed', '_size', 'content_type', 'file', 'filename', 'headers')
@@ -198,9 +198,7 @@ class UploadFile:
         if self._closed:
             raise ValueError('Upload file is closed')
 
-
 type FormValue = str | UploadFile
-
 
 class FormData:
     __slots__ = ('_items',)
@@ -236,12 +234,10 @@ class FormData:
                 closed.add(id(value))
                 await value.close()
 
-
 def _content_type_header(value: str) -> Message:
     message = Message()
     message[HeaderName.CONTENT_TYPE] = value
     return message
-
 
 def _parse_urlencoded_form(body: bytes, content_type: Message) -> FormData:
     charset = content_type.get_content_charset() or 'utf-8'
@@ -251,7 +247,6 @@ def _parse_urlencoded_form(body: bytes, content_type: Message) -> FormData:
     except (LookupError, UnicodeDecodeError, ValueError) as error:
         raise HTTPException(StatusCode.BAD_REQUEST, 'Malformed URL-encoded form body') from error
     return FormData(items)
-
 
 async def _parse_large_urlencoded_form(body: bytes, content_type: Message) -> FormData:
     charset = content_type.get_content_charset() or 'utf-8'
@@ -274,7 +269,6 @@ async def _parse_large_urlencoded_form(body: bytes, content_type: Message) -> Fo
     except (LookupError, UnicodeDecodeError, ValueError) as error:
         raise HTTPException(StatusCode.BAD_REQUEST, 'Malformed URL-encoded form body') from error
     return FormData(items)
-
 
 class MultipartPart:
     __slots__ = (
@@ -349,7 +343,6 @@ class MultipartPart:
         self._stream_started = True
         async for _ in self._owner._read_part(self):
             pass
-
 
 class MultipartStream(AsyncIterator[MultipartPart]):
     _MAX_HEADER_SIZE = 64 * 1024
@@ -671,7 +664,6 @@ async def _collect_multipart_form(parts: MultipartStream, spool_threshold: int) 
         await FormData(items).close()
         raise
 
-
 class Request[StateT = SimpleNamespace]:
     __slots__ = (
         '_body',
@@ -694,6 +686,7 @@ class Request[StateT = SimpleNamespace]:
         '_received_size',
         '_receive_complete',
         '_route_context',
+        '_route_info',
         '_stream_complete',
         '_stream_started',
         '_upload_spool_threshold',
@@ -746,12 +739,13 @@ class Request[StateT = SimpleNamespace]:
         self._received_size = 0
         self._receive_complete = False
         self._route_context: Any = None
+        self._route_info: RouteInfo | None = None
         self._stream_complete = False
         self._stream_started = False
         self._upload_spool_threshold = upload_spool_threshold
         self._url_builder = url_builder
         self.method = method.upper()
-        self.path = path
+        self.path = route_path(scope)
         self.headers = Headers.from_raw(scope.get('headers', []))
         self.query = QueryParams(scope.get('query_string', b''))
         self.path_params: dict[str, Any] = {}
@@ -787,6 +781,15 @@ class Request[StateT = SimpleNamespace]:
     def disconnected(self) -> bool:
         return self._disconnected
 
+    @property
+    def route(self) -> RouteInfo | None:
+        """Matched route metadata, available before request middleware enters."""
+        return self._route_info
+
+    @property
+    def root_path(self) -> str:
+        return root_path(self.scope)
+
     def supports(self, extension: str) -> bool:
         extensions = self.scope.get('extensions', {})
         return isinstance(extensions, Mapping) and extension in extensions
@@ -794,7 +797,7 @@ class Request[StateT = SimpleNamespace]:
     def url_for(self, endpoint: str, **values: Any) -> str:
         if self._url_builder is None:
             raise RuntimeError('URL building is unavailable for this request')
-        return self._url_builder(endpoint, **values)
+        return prefixed_path(self.scope, self._url_builder(endpoint, **values))
 
     async def stream(self) -> AsyncIterator[bytes]:
         if self._body is not None:
@@ -1002,17 +1005,13 @@ class Request[StateT = SimpleNamespace]:
         except (LookupError, UnicodeDecodeError) as error:
             raise HTTPException(StatusCode.BAD_REQUEST, 'Could not decode request body') from error
 
-
 _request_context: ContextVar[Request[Any]] = ContextVar('ryuuseigun_request')
-
 
 def set_request_context(value: Request[Any]) -> Token[Request[Any]]:
     return _request_context.set(value)
 
-
 def reset_request_context(token: Token[Request[Any]]) -> None:
     _request_context.reset(token)
-
 
 def current_request() -> Request[Any]:
     try:
@@ -1020,10 +1019,8 @@ def current_request() -> Request[Any]:
     except LookupError as error:
         raise RuntimeError('No active request context') from error
 
-
 def url_for(endpoint: str, **values: Any) -> str:
     return current_request().url_for(endpoint, **values)
-
 
 class RequestProxy:
     @property
@@ -1100,6 +1097,5 @@ class RequestProxy:
 
     async def text(self, encoding: str = 'utf-8') -> str:
         return await current_request().text(encoding)
-
 
 request = RequestProxy()
