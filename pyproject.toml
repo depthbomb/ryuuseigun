@@ -20,7 +20,7 @@ Issues = 'https://github.com/depthbomb/ryuuseigun/issues'
 dev = ['build', 'twine', 'pytest', 'pytest-cov', 'ruff', 'mypy']
 server = ['granian>=2.5']
 compression = ['brotli>=1.1']
-benchmark = ['quart>=0.23', 'starlette>=1.0']
+benchmark = ['granian>=2.5', 'quart>=0.23', 'starlette>=1.0', 'psutil>=7.2']
 examples = ['sqrrl>=0.4.1,<0.5', 'starlette>=1.0']
 
 [tool.hatch.build.targets.sdist]

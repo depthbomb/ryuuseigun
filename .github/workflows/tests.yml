@@ -98,7 +98,7 @@ jobs:
       - name: Test installed wheel with coverage
         run: |
           test_dir=$(mktemp -d)
-          cp -R tests examples "$test_dir/"
+          cp -R tests examples benchmarks "$test_dir/"
           cp pyproject.toml "$test_dir/"
           cd "$test_dir"
           python -m pytest tests --import-mode=importlib --cov=ryuuseigun --cov-branch --cov-report=term-missing --cov-report="xml:$RUNNER_TEMP/coverage.xml"
