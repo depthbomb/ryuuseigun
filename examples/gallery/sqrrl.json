@@ -1,0 +1,5 @@
+{
+  "schema": "examples.gallery.schema:schema",
+  "output": "database_models.py",
+  "migrations": "migrations"
+}

@@ -1,0 +1,107 @@
+{
+  "after": "7df2ca6e8c2f2bf3a792205147a7a39cc3e6a04b01c821b838caf84ac92c012d",
+  "before": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "checksum": "b66e30afe8c01f25d4ba02f5e95b3048c5cb01a9979faf34f8d928b1a4fd294b",
+  "format": 1,
+  "name": "initial",
+  "parent": "",
+  "schema": {
+    "tables": [
+      {
+        "checks": [],
+        "fields": [
+          {
+            "default_sql": null,
+            "is_immutable": false,
+            "is_nullable": false,
+            "is_primary": true,
+            "is_unique": false,
+            "key": "id",
+            "kind": "integer",
+            "name": "id",
+            "reference": null
+          },
+          {
+            "default_sql": null,
+            "is_immutable": false,
+            "is_nullable": false,
+            "is_primary": false,
+            "is_unique": false,
+            "key": "title",
+            "kind": "text",
+            "name": "title",
+            "reference": null
+          },
+          {
+            "default_sql": null,
+            "is_immutable": false,
+            "is_nullable": true,
+            "is_primary": false,
+            "is_unique": false,
+            "key": "content",
+            "kind": "blob",
+            "name": "content",
+            "reference": null
+          }
+        ],
+        "foreign_keys": [],
+        "indexes": [],
+        "key": "images",
+        "model": "Image",
+        "name": "images",
+        "non_strict": false,
+        "primary_key": []
+      },
+      {
+        "checks": [],
+        "fields": [
+          {
+            "default_sql": null,
+            "is_immutable": false,
+            "is_nullable": false,
+            "is_primary": true,
+            "is_unique": false,
+            "key": "token",
+            "kind": "text",
+            "name": "token",
+            "reference": null
+          },
+          {
+            "default_sql": null,
+            "is_immutable": false,
+            "is_nullable": false,
+            "is_primary": false,
+            "is_unique": false,
+            "key": "csrf",
+            "kind": "text",
+            "name": "csrf",
+            "reference": null
+          },
+          {
+            "default_sql": null,
+            "is_immutable": false,
+            "is_nullable": false,
+            "is_primary": false,
+            "is_unique": false,
+            "key": "expires",
+            "kind": "real",
+            "name": "expires",
+            "reference": null
+          }
+        ],
+        "foreign_keys": [],
+        "indexes": [],
+        "key": "sessions",
+        "model": "Session",
+        "name": "sessions",
+        "non_strict": false,
+        "primary_key": []
+      }
+    ]
+  },
+  "statements": [
+    "CREATE TABLE main.\"images\" (\n  \"id\" INTEGER PRIMARY KEY NOT NULL,\n  \"title\" TEXT NOT NULL,\n  \"content\" BLOB\n) STRICT;",
+    "CREATE TABLE main.\"sessions\" (\n  \"token\" TEXT NOT NULL,\n  \"csrf\" TEXT NOT NULL,\n  \"expires\" REAL NOT NULL,\n  PRIMARY KEY (\"token\")\n) STRICT;"
+  ],
+  "version": 1
+}

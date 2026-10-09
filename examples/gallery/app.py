@@ -1,15 +1,22 @@
+"""A small gallery with developer-owned sessions, CSRF checks and sqrrl storage.
+
+For this single-process demo, startup applies the checked-in migrations. In a
+deployment with several workers, apply migrations separately before starting
+them. The rate limiter is process-local; replace it with your own shared store
+when requests can land on more than one worker.
+"""
 from uuid import uuid4
+from pathlib import Path
+from sqrrl import Database
 from time import perf_counter
 from secrets import compare_digest
-from ryuuseigun.openapi import OpenAPI
+from sqrrl.migrate import load, apply
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from examples.gallery.storage import Storage
 from examples.gallery.rate_limits import Bucket
-from sqlalchemy.ext.asyncio import create_async_engine
 from examples.gallery.auth import requires_authentication
-from ryuuseigun.validation import parse_json, parse_query
-from examples.gallery.models import Page, Login, ImageList, CreateImage, ImageRecord, GalleryState
+from examples.gallery.models import GalleryState, GalleryResources
 from ryuuseigun import (
     Next,
     abort,
@@ -25,19 +32,17 @@ from ryuuseigun import (
 )
 
 def create_app(
-    *, password: str, database_url: str = 'sqlite+aiosqlite:///gallery.db',
+    *, password: str, database_path: str | Path = 'gallery.db',
     secure_cookies: bool = True, allowed_origin: str = 'https://testserver',
-) -> Ryuuseigun[GalleryState]:
+) -> Ryuuseigun[GalleryState, GalleryResources]:
     if not password:
         raise ValueError('Provide a non-empty gallery password')
-    app = Ryuuseigun[GalleryState](
+    app = Ryuuseigun[GalleryState, GalleryResources](
         __name__, request_state_factory=GalleryState,
+        app_state_factory=GalleryResources,
         config=Config(max_request_body_size=1024 * 1024),
     )
     api = Module[GalleryState]('api', url_prefix='/api')
-    schema = OpenAPI(app, title='Gallery', version='0.1', security_schemes={
-        'session': {'type': 'apiKey', 'in': 'cookie', 'name': 'session'},
-    })
     images_bucket = Bucket(2, 1)
 
     @app.middleware
@@ -50,16 +55,16 @@ def create_app(
 
     @app.lifespan
     @asynccontextmanager
-    async def resources(app: Ryuuseigun[GalleryState]) -> AsyncIterator[None]:
-        engine = create_async_engine(database_url)
-        try:
-            app.state.storage = Storage(engine)
-            await app.state.storage.initialize()
+    async def resources(app: Ryuuseigun[GalleryState, GalleryResources]) -> AsyncIterator[None]:
+        async with await Database.create(database_path) as database:
+            await apply(database, load(Path(__file__).with_name('migrations')))
+            app.state.storage = Storage(database)
             app.state.ready = True
-            yield
-        finally:
-            app.state.ready = False
-            await engine.dispose()
+            try:
+                yield
+            finally:
+                app.state.ready = False
+                app.state.storage = None
 
     @app.before_request
     async def session(req: Request[GalleryState]) -> None:
@@ -70,7 +75,7 @@ def create_app(
                 abort(403, 'Origin is not allowed')
         token = req.cookies.get('session')
         if token:
-            storage: Storage = app.state.storage
+            storage = app.state.get_storage()
             csrf = await storage.session(token)
             if csrf is not None:
                 req.state.user = 'demo'
@@ -92,14 +97,18 @@ def create_app(
         return res
 
     @app.post('/login')
-    @schema.schema(body=Login, responses={303: None, 401: None})
     async def login(req: Request[GalleryState]) -> Response:
-        credentials = await parse_json(req, Login)
-        if credentials.username != 'demo' or not compare_digest(credentials.password.encode(), password.encode()):
+        credentials = await req.json()
+        if not isinstance(credentials, dict):
+            abort(400, 'Provide a username and password')
+        supplied_password = credentials.get('password')
+        if not isinstance(supplied_password, str):
+            abort(400, 'Provide a password')
+        if credentials.get('username') != 'demo' or not compare_digest(supplied_password.encode(), password.encode()):
             abort(401, 'Invalid credentials')
-        storage: Storage = app.state.storage
+        storage = app.state.get_storage()
         token, _ = await storage.login()
-        res = redirect('/account', 303)
+        res = redirect(req.url_for('account'), 303)
         res.set_cookie('session', token, max_age=3600, secure=secure_cookies, httponly=True)
         return res
 
@@ -111,7 +120,7 @@ def create_app(
     @app.post('/logout')
     @requires_authentication()
     async def logout(req: Request[GalleryState]) -> Response:
-        storage: Storage = app.state.storage
+        storage = app.state.get_storage()
         await storage.logout(req.cookies['session'])
         res = Response(status_code=204)
         res.delete_cookie('session', secure=secure_cookies, httponly=True)
@@ -119,22 +128,29 @@ def create_app(
 
     @api.post('/images')
     @requires_authentication()
-    @schema.schema(body=CreateImage, responses={201: ImageRecord, 401: None, 403: None, 429: None}, security=('session',))
-    @images_bucket.consume(cost=2)
     async def create_image(req: Request[GalleryState]) -> JSONResponse:
-        payload = await parse_json(req, CreateImage)
-        storage: Storage = app.state.storage
-        record = await storage.create(payload.title)
-        return JSONResponse(record.model_dump(mode='json'), status_code=201)
+        payload = await req.json()
+        title = payload.get('title') if isinstance(payload, dict) else None
+        if not isinstance(title, str) or not 1 <= len(title) <= 120:
+            abort(422, 'Title must be a string between 1 and 120 characters')
+        return await save_image(req, title)
+
+    @images_bucket.consume(cost=2)
+    async def save_image(req: Request[GalleryState], title: str) -> JSONResponse:
+        record = await app.state.get_storage().create(title)
+        return JSONResponse({'id': record.id, 'title': record.title}, status_code=201)
 
     @api.get('/images')
     @requires_authentication()
-    @schema.schema(query=Page, responses={200: ImageList, 401: None}, security=('session',))
     async def images(req: Request[GalleryState]) -> JSONResponse:
-        page = parse_query(req, Page)
-        storage: Storage = app.state.storage
-        records = await storage.list_images(page.limit)
-        return JSONResponse(ImageList(images=records).model_dump(mode='json'))
+        try:
+            limit = int(req.query.get('limit', '20') or '')
+        except ValueError:
+            abort(422, 'Limit must be an integer')
+        if not 1 <= limit <= 100:
+            abort(422, 'Limit must be between 1 and 100')
+        records = await app.state.get_storage().list_images(limit)
+        return JSONResponse({'images': [{'id': record.id, 'title': record.title} for record in records]})
 
     @api.put('/images/<int:image_id>/content')
     @requires_authentication()
@@ -143,7 +159,7 @@ def create_app(
         file = form.get('image')
         if not isinstance(file, UploadFile):
             abort(400, 'Provide an image file')
-        storage: Storage = app.state.storage
+        storage = app.state.get_storage()
         if not await storage.put_content(image_id, await file.read()):
             abort(404)
         return Response(status_code=204)
@@ -151,7 +167,7 @@ def create_app(
     @api.get('/images/<int:image_id>/content')
     @requires_authentication()
     async def download(req: Request[GalleryState], image_id: int) -> StreamingResponse:
-        storage: Storage = app.state.storage
+        storage = app.state.get_storage()
         content = await storage.content(image_id)
         if content is None:
             abort(404)

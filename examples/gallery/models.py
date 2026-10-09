@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from pydantic import Field, BaseModel
+from examples.gallery.storage import Storage
 
 @dataclass(slots=True)
 class GalleryState:
@@ -7,19 +7,13 @@ class GalleryState:
     user: str | None = None
     csrf_token: str = ''
 
-class Login(BaseModel):
-    username: str
-    password: str
+@dataclass(slots=True)
+class GalleryResources:
+    ready: bool = False
+    storage: Storage | None = None
 
-class CreateImage(BaseModel):
-    title: str = Field(min_length=1, max_length=120)
+    def get_storage(self) -> Storage:
+        if self.storage is None:
+            raise RuntimeError('The gallery lifespan has not started')
 
-class ImageRecord(BaseModel):
-    id: int
-    title: str
-
-class ImageList(BaseModel):
-    images: list[ImageRecord]
-
-class Page(BaseModel):
-    limit: int = Field(default=20, ge=1, le=100)
+        return self.storage
