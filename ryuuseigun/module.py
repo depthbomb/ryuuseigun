@@ -20,8 +20,8 @@ class RouteDefinition:
     middlewares: tuple[MiddlewareCallable[Any], ...] = ()
 
 @dataclass(slots=True, frozen=True)
-class MountedModule[StateT = Any]:
-    module: 'Module[StateT]'
+class MountedModule[StateT = Any, SocketStateT = Any]:
+    module: 'Module[StateT, SocketStateT]'
     url_prefix: str
 
 @dataclass(slots=True, frozen=True)
@@ -31,7 +31,7 @@ class WebSocketDefinition:
     endpoint: str
     middlewares: tuple[WebSocketMiddleware, ...] = ()
 
-class Module[StateT = Any](Registration[StateT]):
+class Module[StateT = Any, SocketStateT = Any](Registration[StateT, SocketStateT]):
     def __init__(self, name: str, *, url_prefix: str = '') -> None:
         super().__init__()
         if not name or '.' in name:
@@ -40,7 +40,7 @@ class Module[StateT = Any](Registration[StateT]):
         self._url_prefix = url_prefix
         self._routes: list[RouteDefinition] = []
         self._websocket_routes: list[WebSocketDefinition] = []
-        self._modules: list[MountedModule[StateT]] = []
+        self._modules: list[MountedModule[StateT, SocketStateT]] = []
 
     @property
     def name(self) -> str:
@@ -59,7 +59,7 @@ class Module[StateT = Any](Registration[StateT]):
         return tuple(self._websocket_routes)
 
     @property
-    def modules(self) -> tuple[MountedModule[StateT], ...]:
+    def modules(self) -> tuple[MountedModule[StateT, SocketStateT], ...]:
         return tuple(self._modules)
 
     def add_url_rule(
@@ -83,8 +83,8 @@ class Module[StateT = Any](Registration[StateT]):
         ))
 
     def add_websocket_rule(
-        self, path: str, handler: WebSocketHandler, *, endpoint: str | None = None,
-        middlewares: Iterable[WebSocketMiddleware] = (),
+        self, path: str, handler: WebSocketHandler[SocketStateT], *, endpoint: str | None = None,
+        middlewares: Iterable[WebSocketMiddleware[SocketStateT]] = (),
     ) -> None:
         self._ensure_mutable()
         require_async(handler, 'WebSocket handler')
@@ -94,7 +94,7 @@ class Module[StateT = Any](Registration[StateT]):
         route_name = str(endpoint or getattr(handler, '__name__', type(handler).__name__))
         self._websocket_routes.append(WebSocketDefinition(path, handler, route_name, active_middlewares))
 
-    def register_module(self, module: 'Module[StateT]', *, url_prefix: str = '') -> None:
+    def register_module(self, module: 'Module[StateT, SocketStateT]', *, url_prefix: str = '') -> None:
         self._ensure_mutable()
         if module is self:
             raise ValueError('A module cannot register itself')

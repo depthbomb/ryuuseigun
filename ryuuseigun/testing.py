@@ -2,10 +2,9 @@ from orjson import loads
 from math import isfinite
 from types import TracebackType
 from collections.abc import Mapping
-from ryuuseigun.app import Ryuuseigun
 from ryuuseigun.headers import Headers
 from dataclasses import field, dataclass
-from ryuuseigun.types import ASGIMessage
+from ryuuseigun.types import ASGIMessage, ASGIApplication
 from ryuuseigun._tasks import cancel_and_join
 from ryuuseigun._lifespan import LifespanSession
 from urllib.request import Request as CookieRequest
@@ -68,7 +67,7 @@ class TestResponse:
 
 class TestClient[StateT = Any]:
     def __init__(
-        self, app: Ryuuseigun[StateT], *, base_url: str = 'http://testserver',
+        self, app: ASGIApplication, *, base_url: str = 'http://testserver',
         follow_redirects: bool = False, max_redirects: int = 20, lifespan_timeout: float = 10,
     ) -> None:
         if not isinstance(max_redirects, int) or isinstance(max_redirects, bool) or max_redirects < 0:
@@ -323,7 +322,7 @@ class WebSocketUpgradeError(Exception):
 class WebSocketTestSession:
     def __init__(
         self,
-        app: Ryuuseigun[Any],
+        app: ASGIApplication,
         path: str,
         *,
         headers: Optional[Mapping[str, str]] = None,

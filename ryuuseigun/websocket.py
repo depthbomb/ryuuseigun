@@ -1,3 +1,4 @@
+from typing import overload, Concatenate, Protocol
 from dataclasses import dataclass
 from types import SimpleNamespace
 from ryuuseigun.headers import Headers
@@ -6,18 +7,24 @@ from ryuuseigun.metadata import RouteInfo
 from ryuuseigun.request import QueryParams
 from orjson import dumps, loads, JSONDecodeError
 from ryuuseigun._paths import root_path, route_path
-from typing import Any, TypeVar, Optional, TypeAlias
+from typing import Any, Optional
 from ryuuseigun.routing import Converter, normalize_path
 from collections.abc import Callable, Sequence, Awaitable
 from ryuuseigun.handlers import require_async, validate_middleware
 from ryuuseigun.types import Send, Receive, ASGIScope, JSONValue, ASGIMessage, HeaderMapping
 from ryuuseigun.constants import HeaderName, StatusCode, ASGIExtension, ASGIMessageType, WebSocketCloseCode
 
-WebSocketHandler: TypeAlias = Callable[..., Awaitable[None]]
-WebSocketHandlerType = TypeVar('WebSocketHandlerType', bound=WebSocketHandler)
-WebSocketInvoker: TypeAlias = Callable[['WebSocket', dict[str, Any]], Awaitable[None]]
-WebSocketNext: TypeAlias = Callable[['WebSocket'], Awaitable[None]]
-WebSocketMiddleware: TypeAlias = Callable[['WebSocket', WebSocketNext], Awaitable[None]]
+type WebSocketHandler[StateT = Any] = Callable[Concatenate[WebSocket[StateT], ...], Awaitable[None]]
+type WebSocketInvoker = Callable[[WebSocket[Any], dict[str, Any]], Awaitable[None]]
+type WebSocketNext[StateT = Any] = Callable[[WebSocket[StateT]], Awaitable[None]]
+type WebSocketMiddleware[StateT = Any] = Callable[[WebSocket[StateT], WebSocketNext[StateT]], Awaitable[None]]
+
+class WebSocketDecorator[StateT](Protocol):
+    def __call__[**Parameters](
+        self, handler: Callable[Concatenate[WebSocket[StateT], Parameters], Awaitable[None]], /,
+    ) -> Callable[Concatenate[WebSocket[StateT], Parameters], Awaitable[None]]: ...
+
+_MISSING = object()
 
 class WebSocketDisconnect(Exception):
     def __init__(self, code: int = WebSocketCloseCode.NORMAL, reason: str = '') -> None:
@@ -25,7 +32,7 @@ class WebSocketDisconnect(Exception):
         self.reason = reason
         super().__init__(f'WebSocket disconnected with code {code}: {reason}')
 
-class WebSocket:
+class WebSocket[StateT = SimpleNamespace]:
     __slots__ = (
         '_accepted',
         '_closed',
@@ -43,12 +50,25 @@ class WebSocket:
         'state',
     )
 
+    @overload
+    def __init__(
+        self: 'WebSocket[SimpleNamespace]', scope: ASGIScope, receive: Receive, send: Send, *,
+        json_options: int = 0, default_response_headers: tuple[tuple[str, str], ...] = (),
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self, scope: ASGIScope, receive: Receive, send: Send, *, state: StateT,
+        json_options: int = 0, default_response_headers: tuple[tuple[str, str], ...] = (),
+    ) -> None: ...
+
     def __init__(
         self,
         scope: ASGIScope,
         receive: Receive,
         send: Send,
         *,
+        state: Any = _MISSING,
         json_options: int = 0,
         default_response_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
@@ -65,7 +85,9 @@ class WebSocket:
         self.headers = Headers.from_raw(scope.get('headers', []))
         self.query = QueryParams(scope.get('query_string', b''))
         self.path_params: dict[str, Any] = {}
-        self.state = SimpleNamespace()
+        if state is _MISSING:
+            state = SimpleNamespace()
+        self.state: StateT = state
 
     @property
     def accepted(self) -> bool:
@@ -287,7 +309,7 @@ def build_websocket_invoker(handler: WebSocketHandler, param_names: Sequence[str
     marker = object()
     signature(handler).bind(marker, **dict.fromkeys(param_names, marker))
 
-    def invoke(socket: WebSocket, params: dict[str, Any]) -> Awaitable[None]:
+    def invoke(socket: WebSocket[Any], params: dict[str, Any]) -> Awaitable[None]:
         if params:
             return handler(socket, **params)
 

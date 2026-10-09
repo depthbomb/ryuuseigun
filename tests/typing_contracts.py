@@ -1,4 +1,7 @@
 from dataclasses import dataclass
+from typing import assert_type
+from types import SimpleNamespace
+from ryuuseigun import WebSocket, WebSocketNext
 from ryuuseigun import Next, Module, Ryuuseigun, Request, Response
 
 @dataclass
@@ -64,3 +67,27 @@ async def client_options() -> None:
     client = app.test_client(base_url='https://testserver')
     await client.post('/', form={'field': 'value'}, files={'file': ('a.txt', b'a', 'text/plain')})
     await client.post('/', jsno={})  # type: ignore[call-arg]
+
+typed = Ryuuseigun[State, OtherState, State](
+    __name__, request_state_factory=State, app_state_factory=OtherState, websocket_state_factory=State,
+)
+assert_type(typed.state, OtherState)
+assert_type(Ryuuseigun(__name__).state, SimpleNamespace)
+socket_module = Module[State, State]('sockets')
+
+@typed.websocket('/socket')
+async def typed_socket(socket: WebSocket[State]) -> None:
+    assert_type(socket.state, State)
+    await socket.send_text(socket.state.name)
+
+async def wrong_socket(socket: WebSocket[OtherState]) -> None:
+    pass
+
+async def wrong_socket_middleware(socket: WebSocket[OtherState], next: WebSocketNext[OtherState]) -> None:
+    await next(socket)
+
+typed.websocket('/wrong')(wrong_socket)  # type: ignore[arg-type]
+socket_module.websocket('/wrong')(wrong_socket)  # type: ignore[arg-type]
+typed.add_websocket_rule('/wrong-direct', wrong_socket)  # type: ignore[arg-type]
+typed.websocket_middleware(wrong_socket_middleware)  # type: ignore[arg-type]
+socket_module.websocket_middleware(wrong_socket_middleware)  # type: ignore[arg-type]

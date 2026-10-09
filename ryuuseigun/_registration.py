@@ -9,13 +9,13 @@ from collections.abc import Mapping, Callable, Iterable, Awaitable
 from ryuuseigun.routing import RouteHandler, RouteDecorator, normalize_query_media_types
 from ryuuseigun.handlers import validate_handler, validate_middleware, validate_error_handler_key
 from ryuuseigun.handlers import AfterHandler, ErrorHandler, BeforeHandler, ErrorDecorator, ErrorHandlerFor
-from ryuuseigun.websocket import WebSocketHandler, WebSocketMiddleware, WebSocketHandlerType, validate_websocket_middleware
+from ryuuseigun.websocket import WebSocketHandler, WebSocketMiddleware, WebSocket, WebSocketDecorator, validate_websocket_middleware
 
-class Registration[StateT]:
+class Registration[StateT, SocketStateT = Any]:
     def __init__(self) -> None:
         self._frozen = False
         self._middlewares: list[MiddlewareCallable[StateT]] = []
-        self._websocket_middlewares: list[WebSocketMiddleware] = []
+        self._websocket_middlewares: list[WebSocketMiddleware[SocketStateT]] = []
         self._before_handlers: list[BeforeHandler[StateT]] = []
         self._after_handlers: list[AfterHandler[StateT]] = []
         self._error_handlers: dict[int | type[Exception], Callable[..., Awaitable[ResponseValue]]] = {}
@@ -25,7 +25,7 @@ class Registration[StateT]:
         return tuple(self._middlewares)
 
     @property
-    def websocket_middlewares(self) -> tuple[WebSocketMiddleware, ...]:
+    def websocket_middlewares(self) -> tuple[WebSocketMiddleware[SocketStateT], ...]:
         return tuple(self._websocket_middlewares)
 
     @property
@@ -124,11 +124,13 @@ class Registration[StateT]:
         return decorator
 
     def websocket(
-        self, path: str, *, endpoint: str | None = None, middlewares: Iterable[WebSocketMiddleware] = (),
-    ) -> Callable[[WebSocketHandlerType], WebSocketHandlerType]:
+        self, path: str, *, endpoint: str | None = None, middlewares: Iterable[WebSocketMiddleware[SocketStateT]] = (),
+    ) -> WebSocketDecorator[SocketStateT]:
         selected_middlewares = tuple(middlewares)
 
-        def decorator(handler: WebSocketHandlerType) -> WebSocketHandlerType:
+        def decorator[**Parameters](
+            handler: Callable[Concatenate[WebSocket[SocketStateT], Parameters], Awaitable[None]],
+        ) -> Callable[Concatenate[WebSocket[SocketStateT], Parameters], Awaitable[None]]:
             self.add_websocket_rule(path, handler, endpoint=endpoint, middlewares=selected_middlewares)
             return handler
 
@@ -142,8 +144,8 @@ class Registration[StateT]:
         raise NotImplementedError
 
     def add_websocket_rule(
-        self, path: str, handler: WebSocketHandler, *, endpoint: str | None = None,
-        middlewares: Iterable[WebSocketMiddleware] = (),
+        self, path: str, handler: WebSocketHandler[SocketStateT], *, endpoint: str | None = None,
+        middlewares: Iterable[WebSocketMiddleware[SocketStateT]] = (),
     ) -> None:
         raise NotImplementedError
 
@@ -153,7 +155,7 @@ class Registration[StateT]:
         self._middlewares.append(handler)
         return handler
 
-    def websocket_middleware(self, handler: WebSocketMiddleware) -> WebSocketMiddleware:
+    def websocket_middleware(self, handler: WebSocketMiddleware[SocketStateT]) -> WebSocketMiddleware[SocketStateT]:
         self._ensure_mutable()
         validate_websocket_middleware(handler)
         self._websocket_middlewares.append(handler)

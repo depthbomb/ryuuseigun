@@ -119,26 +119,76 @@ def _route_endpoint(endpoint: Optional[str], name: Optional[str]) -> Optional[st
         raise ValueError('Route endpoint and name must match when both are provided')
     return name if name is not None else endpoint
 
-class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
+class Ryuuseigun[
+    RequestStateT = SimpleNamespace, AppStateT = SimpleNamespace, SocketStateT = SimpleNamespace,
+](Registration[RequestStateT, SocketStateT]):
+    """An ASGI application with explicitly owned state and resource lifetimes.
+
+    Application state is created once per application instance. HTTP and socket
+    factories run once per connection, never share request state, and carry their
+    types through registration. Register everything before finalize/startup.
+    Resource contexts enter in registration order and unwind in reverse, including
+    startup rollback. Request middleware owns sending and cleanup; after_request
+    runs before sending, while response after_send callbacks are process-local.
+    """
     @overload
     def __init__(
-        self: 'Ryuuseigun[SimpleNamespace]',
-        import_name: str,
-        *,
-        config: Optional[Config] = None,
-        strict_slashes: Optional[bool] = None,
-        debug: Optional[bool] = None,
+        self: 'Ryuuseigun[SimpleNamespace, SimpleNamespace, SimpleNamespace]', import_name: str, *,
+        config: Config | None = None, strict_slashes: bool | None = None, debug: bool | None = None,
     ) -> None: ...
 
     @overload
     def __init__(
-        self,
-        import_name: str,
-        *,
+        self: 'Ryuuseigun[SimpleNamespace, SimpleNamespace, SocketStateT]', import_name: str, *,
+        websocket_state_factory: Callable[[], SocketStateT],
+        config: Config | None = None, strict_slashes: bool | None = None, debug: bool | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: 'Ryuuseigun[SimpleNamespace, AppStateT, SimpleNamespace]', import_name: str, *,
+        app_state_factory: Callable[[], AppStateT],
+        config: Config | None = None, strict_slashes: bool | None = None, debug: bool | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: 'Ryuuseigun[SimpleNamespace, AppStateT, SocketStateT]', import_name: str, *,
+        app_state_factory: Callable[[], AppStateT],
+        websocket_state_factory: Callable[[], SocketStateT],
+        config: Config | None = None, strict_slashes: bool | None = None, debug: bool | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: 'Ryuuseigun[RequestStateT, SimpleNamespace, SimpleNamespace]', import_name: str, *,
         request_state_factory: Callable[[], RequestStateT],
-        config: Optional[Config] = None,
-        strict_slashes: Optional[bool] = None,
-        debug: Optional[bool] = None,
+        config: Config | None = None, strict_slashes: bool | None = None, debug: bool | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: 'Ryuuseigun[RequestStateT, SimpleNamespace, SocketStateT]', import_name: str, *,
+        request_state_factory: Callable[[], RequestStateT],
+        websocket_state_factory: Callable[[], SocketStateT],
+        config: Config | None = None, strict_slashes: bool | None = None, debug: bool | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: 'Ryuuseigun[RequestStateT, AppStateT, SimpleNamespace]', import_name: str, *,
+        request_state_factory: Callable[[], RequestStateT],
+        app_state_factory: Callable[[], AppStateT],
+        config: Config | None = None, strict_slashes: bool | None = None, debug: bool | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: 'Ryuuseigun[RequestStateT, AppStateT, SocketStateT]', import_name: str, *,
+        request_state_factory: Callable[[], RequestStateT],
+        app_state_factory: Callable[[], AppStateT],
+        websocket_state_factory: Callable[[], SocketStateT],
+        config: Config | None = None, strict_slashes: bool | None = None, debug: bool | None = None,
     ) -> None: ...
 
     def __init__(
@@ -149,6 +199,8 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
         strict_slashes: Optional[bool] = None,
         debug: Optional[bool] = None,
         request_state_factory: Optional[Callable[[], RequestStateT]] = None,
+        app_state_factory: Optional[Callable[[], AppStateT]] = None,
+        websocket_state_factory: Optional[Callable[[], SocketStateT]] = None,
     ) -> None:
         super().__init__()
         settings = config or Config()
@@ -176,7 +228,7 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
         self._websocket_routes: list[WebSocketRoute] = []
         self._pipelines: dict[int, Next[RequestStateT]] = {}
         self._method_pipelines: dict[int, Next[RequestStateT]] = {}
-        self._websocket_pipelines: dict[int, WebSocketNext] = {}
+        self._websocket_pipelines: dict[int, WebSocketNext[SocketStateT]] = {}
         self._fallback_pipeline: Next[RequestStateT] = self._terminal
         self._request_state_factory: Callable[[], Any] = (
             SimpleNamespace if request_state_factory is None else request_state_factory
@@ -184,9 +236,11 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
         self._startup_handlers: list[Callable[[], Awaitable[None]]] = []
         self._shutdown_handlers: list[Callable[[], Awaitable[None]]] = []
         self._lifespan_factories: list[
-            Callable[['Ryuuseigun[RequestStateT]'], AbstractAsyncContextManager[None]]
+            Callable[['Ryuuseigun[RequestStateT, AppStateT, SocketStateT]'], AbstractAsyncContextManager[None]]
         ] = []
-        self.state = SimpleNamespace()
+        application_factory: Callable[[], Any] = app_state_factory or SimpleNamespace
+        self.state: AppStateT = application_factory()
+        self._websocket_state_factory: Callable[[], Any] = websocket_state_factory or SimpleNamespace
         self._finalizers: list[Callable[[], None]] = []
         self._mounts: list[Mount] = []
         self._mount_lifespans: dict[int, LifespanSession] = {}
@@ -370,11 +424,11 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
     def add_websocket_rule(
         self,
         path: str,
-        handler: WebSocketHandler,
+        handler: WebSocketHandler[SocketStateT],
         *,
         endpoint: Optional[str] = None,
         module_chain: tuple[Module[Any], ...] = (),
-        middlewares: Iterable[WebSocketMiddleware] = (),
+        middlewares: Iterable[WebSocketMiddleware[SocketStateT]] = (),
     ) -> None:
         self._ensure_mutable()
         route = self._create_websocket_route(
@@ -445,7 +499,7 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
             raise KeyError(f'Unknown endpoint: {endpoint}')
         return build_path(route, values)
 
-    def register_module(self, module: Module[RequestStateT], *, url_prefix: str = '') -> None:
+    def register_module(self, module: Module[RequestStateT, SocketStateT], *, url_prefix: str = '') -> None:
         self._ensure_mutable()
         routes = self._collect_module_routes(
             module,
@@ -512,8 +566,8 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
 
     def lifespan(
         self,
-        factory: Callable[['Ryuuseigun[RequestStateT]'], AbstractAsyncContextManager[None]],
-    ) -> Callable[['Ryuuseigun[RequestStateT]'], AbstractAsyncContextManager[None]]:
+        factory: Callable[['Ryuuseigun[RequestStateT, AppStateT, SocketStateT]'], AbstractAsyncContextManager[None]],
+    ) -> Callable[['Ryuuseigun[RequestStateT, AppStateT, SocketStateT]'], AbstractAsyncContextManager[None]]:
         self._ensure_mutable()
         self._lifespan_factories.append(factory)
         return factory
@@ -807,7 +861,7 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
 
     def _collect_module_routes(
         self,
-        module: Module[RequestStateT],
+        module: Module[RequestStateT, SocketStateT],
         *,
         url_prefix: str,
         parent_prefix: str,
@@ -1007,14 +1061,14 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
                 extra={'phase': 'websocket', 'route': route.path if self.debug else None},
             )
 
-    def _compile_websocket_pipeline(self, route: WebSocketRoute) -> WebSocketNext:
-        async def endpoint(current: WebSocket) -> None:
+    def _compile_websocket_pipeline(self, route: WebSocketRoute) -> WebSocketNext[SocketStateT]:
+        async def endpoint(current: WebSocket[SocketStateT]) -> None:
             await route.invoke(current, current.path_params)
             if self._config.websocket_auto_close and not current.closed:
                 await current.close()
 
-        call_next: WebSocketNext = endpoint
-        middlewares: list[WebSocketMiddleware] = [*self.websocket_middlewares]
+        call_next: WebSocketNext[SocketStateT] = endpoint
+        middlewares: list[WebSocketMiddleware[SocketStateT]] = [*self.websocket_middlewares]
         for module in route.module_chain:
             middlewares.extend(module.websocket_middlewares)
         middlewares.extend(route.middlewares)
@@ -1022,9 +1076,9 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
             previous = call_next
 
             def wrapped(
-                current: WebSocket,
-                active: WebSocketMiddleware = middleware,
-                next_call: WebSocketNext = previous,
+                current: WebSocket[SocketStateT],
+                active: WebSocketMiddleware[SocketStateT] = middleware,
+                next_call: WebSocketNext[SocketStateT] = previous,
             ) -> Awaitable[None]:
                 return active(current, next_call)
 
@@ -1032,16 +1086,17 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
 
         return call_next
 
-    def _create_websocket(self, scope: ASGIScope, receive: Receive, send: Send) -> WebSocket:
+    def _create_websocket(self, scope: ASGIScope, receive: Receive, send: Send) -> WebSocket[SocketStateT]:
         return WebSocket(
             scope,
             receive,
             send,
+            state=self._websocket_state_factory(),
             json_options=self._config.json_options,
             default_response_headers=self._config.default_response_headers,
         )
 
-    def _websocket_slash_redirect(self, socket: WebSocket) -> Optional[str]:
+    def _websocket_slash_redirect(self, socket: WebSocket[Any]) -> Optional[str]:
         if not self._config.redirect_slashes or socket.path == '/':
             return None
         redirect_path = socket.path[:-1] if socket.path.endswith('/') else f'{socket.path}/'
@@ -1057,11 +1112,11 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
     def _create_websocket_route(
         self,
         path: str,
-        handler: WebSocketHandler,
+        handler: WebSocketHandler[SocketStateT],
         *,
         endpoint: Optional[str],
         module_chain: tuple[Module[Any], ...],
-        middlewares: tuple[WebSocketMiddleware, ...] = (),
+        middlewares: tuple[WebSocketMiddleware[SocketStateT], ...] = (),
     ) -> WebSocketRoute:
         normalized_path = normalize_path(path, strict_slashes=self._websocket_router.strict_slashes)
         segments, param_names = parse_path(normalized_path)
@@ -1088,7 +1143,7 @@ class Ryuuseigun[RequestStateT = SimpleNamespace](Registration[RequestStateT]):
 
     def _collect_module_websocket_routes(
         self,
-        module: Module[RequestStateT],
+        module: Module[RequestStateT, SocketStateT],
         *,
         url_prefix: str,
         parent_prefix: str,
