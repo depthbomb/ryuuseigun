@@ -1,3 +1,6 @@
+from collections.abc import AsyncIterable, AsyncGenerator
+from ryuuseigun._paths import root_path as normalize_root_path
+from ryuuseigun._testing_stream import HTTPTestStream
 from orjson import loads
 from math import isfinite
 from types import TracebackType
@@ -50,6 +53,7 @@ def _url_scope(path: str, query: Optional[Mapping[str, str]] = None) -> dict[str
 
 @dataclass(slots=True)
 class TestResponse:
+    __test__ = False
     status_code: int
     headers: Headers
     body: bytes
@@ -69,12 +73,14 @@ class TestClient[StateT = Any]:
     def __init__(
         self, app: ASGIApplication, *, base_url: str = 'http://testserver',
         follow_redirects: bool = False, max_redirects: int = 20, lifespan_timeout: float = 10,
+        root_path: str = '',
     ) -> None:
         if not isinstance(max_redirects, int) or isinstance(max_redirects, bool) or max_redirects < 0:
             raise ValueError('max_redirects must be non-negative')
         if not isfinite(lifespan_timeout) or lifespan_timeout <= 0:
             raise ValueError('lifespan_timeout must be finite and positive')
         self.app = app
+        self.root_path = normalize_root_path({'root_path': root_path})
         if urlsplit(base_url).query or urlsplit(base_url).fragment:
             raise ValueError('base_url cannot contain a query or fragment')
         self.base_url = base_url.rstrip('/') + '/'
@@ -86,6 +92,7 @@ class TestClient[StateT = Any]:
         self._state = 'new'
         self._requests: set[Task[None]] = set()
         self._websockets: list[WebSocketTestSession] = []
+        self._streams: list[HTTPTestStream] = []
 
     async def __aenter__(self) -> Self:
         if self._state != 'new':
@@ -105,6 +112,11 @@ class TestClient[StateT = Any]:
         self._state = 'closing'
         errors: list[BaseException] = []
         try:
+            for stream in self._streams:
+                try:
+                    await stream.aclose()
+                except BaseException as error:
+                    errors.append(error)
             tasks = tuple(self._requests)
             try:
                 await cancel_and_join(*tasks)
@@ -143,6 +155,56 @@ class TestClient[StateT = Any]:
             raise ValueError('The in-process test client only supports its configured origin')
         parts = urlsplit(url)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ''))
+
+    def stream(
+        self, method: str, path: str, *, headers: Mapping[str, str] | None = None,
+        body: bytes | str | AsyncIterable[bytes] = b'', timeout_seconds: float = 10,
+        extensions: Mapping[str, Any] | None = None,
+    ) -> HTTPTestStream:
+        """Open a bounded response stream; exiting early disconnects the client.
+
+        Body may be bytes, text or an async iterable of byte chunks. This method
+        does not follow redirects. Use a client context to drive app lifespan.
+        """
+        url = self._url(path)
+        parts = urlsplit(url)
+        request_headers = Headers(headers)
+        request_headers.setdefault(HeaderName.HOST, parts.netloc)
+        cookie_request = CookieRequest(url, headers=dict(request_headers.items()))
+        self.cookies.add_cookie_header(cookie_request)
+        cookie = cookie_request.get_header(HeaderName.COOKIE)
+        if cookie is not None:
+            request_headers.setdefault(HeaderName.COOKIE, cookie)
+        encoded = body.encode() if isinstance(body, str) else body
+        if isinstance(encoded, bytes):
+            request_headers.setdefault(HeaderName.CONTENT_LENGTH, str(len(encoded)))
+
+        async def chunks() -> AsyncGenerator[bytes, None]:
+            if isinstance(encoded, bytes):
+                if encoded:
+                    yield encoded
+            else:
+                iterator = encoded.__aiter__()
+                try:
+                    async for chunk in iterator:
+                        yield chunk
+                finally:
+                    close = getattr(iterator, 'aclose', None)
+                    if close is not None:
+                        await close()
+
+        def remember(response_headers: Headers) -> None:
+            self.cookies.extract_cookies(CookieResponse(response_headers), cookie_request)  # type: ignore[arg-type]
+
+        stream = HTTPTestStream(self.app, {
+            'type': 'http', 'method': method.upper(), 'scheme': parts.scheme, 'http_version': '1.1',
+            'asgi': {'version': '3.0', 'spec_version': '2.5'}, **_url_scope(url),
+            'headers': request_headers.raw(), 'root_path': self.root_path,
+            'server': self._origin[1:], 'client': ('127.0.0.1', 50000),
+            'state': dict(self._lifespan.state), 'extensions': dict(extensions or {}),
+        }, chunks(), timeout_seconds=timeout_seconds, on_headers=remember, on_enter=lambda: self._url(path))
+        self._streams.append(stream)
+        return stream
 
     async def request(
         self,
@@ -233,6 +295,8 @@ class TestClient[StateT = Any]:
             'headers': request_headers.raw(),
             'client': ('127.0.0.1', 50000),
             'server': self._origin[1:],
+            'root_path': self.root_path,
+            'state': dict(self._lifespan.state),
             'extensions': dict(extensions or {}),
         }
         task = create_task(self.app(scope, receive, send))
@@ -309,6 +373,8 @@ class TestClient[StateT = Any]:
         session = WebSocketTestSession(self.app, url, headers=request_headers, subprotocols=subprotocols)
         session.scope['scheme'] = 'wss' if self._origin[0] == 'https' else 'ws'
         session.scope['server'] = self._origin[1:]
+        session.scope['root_path'] = self.root_path
+        session.scope['state'] = dict(self._lifespan.state)
         session._owner = self
         self._websockets.append(session)
         return session

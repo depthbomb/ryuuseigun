@@ -543,13 +543,13 @@ class Ryuuseigun[
 
     def test_client(
         self, *, base_url: str = 'http://testserver', follow_redirects: bool = False,
-        max_redirects: int = 20, lifespan_timeout: float = 10,
+        max_redirects: int = 20, lifespan_timeout: float = 10, root_path: str = '',
     ) -> 'TestClient[RequestStateT]':
         from ryuuseigun.testing import TestClient
 
         return TestClient(
             self, base_url=base_url, follow_redirects=follow_redirects,
-            max_redirects=max_redirects, lifespan_timeout=lifespan_timeout,
+            max_redirects=max_redirects, lifespan_timeout=lifespan_timeout, root_path=root_path,
         )
 
     def startup(self, handler: Callable[[], Awaitable[None]]) -> Callable[[], Awaitable[None]]:
