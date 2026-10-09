@@ -1,8 +1,7 @@
-from dataclasses import dataclass
 from typing import assert_type
+from dataclasses import dataclass
 from types import SimpleNamespace
-from ryuuseigun import WebSocket, WebSocketNext
-from ryuuseigun import Next, Module, Ryuuseigun, Request, Response
+from ryuuseigun import Next, Module, Request, Response, WebSocket, Ryuuseigun, WebSocketNext
 
 @dataclass
 class State:

@@ -5,7 +5,7 @@ from ryuuseigun.headers import Headers
 from ryuuseigun._tasks import cancel_and_join
 from collections.abc import Callable, AsyncIterator, AsyncGenerator
 from ryuuseigun.types import ASGIScope, ASGIMessage, ASGIApplication
-from asyncio import Task, Event, Queue, timeout, wait, create_task, ensure_future, FIRST_COMPLETED
+from asyncio import Task, wait, Event, Queue, timeout, create_task, ensure_future, FIRST_COMPLETED
 
 class HTTPTestStream:
     """Consume HTTP chunks while the application is still running.

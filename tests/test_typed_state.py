@@ -1,5 +1,5 @@
-from unittest import IsolatedAsyncioTestCase
 from examples.composition import create_app
+from unittest import IsolatedAsyncioTestCase
 
 class TypedStateTests(IsolatedAsyncioTestCase):
     async def test_services_and_connection_state_are_isolated(self):

@@ -1,10 +1,51 @@
 from asyncio import Event
-from dataclasses import FrozenInstanceError
 from contextlib import asynccontextmanager
+from dataclasses import FrozenInstanceError
 from unittest import IsolatedAsyncioTestCase
 from ryuuseigun import Config, Module, Request, Response, Ryuuseigun
 
 class CompositionTests(IsolatedAsyncioTestCase):
+    async def test_stripped_unicode_prefix_preserves_external_scope(self):
+        app = Ryuuseigun('root')
+        received = []
+
+        async def external(scope, receive, send):
+            received.append(scope)
+            await Response('external').send(send)
+
+        app.mount('/caf\u00e9', external, name='static')
+        self.assertEqual(app.url_for('static', path='/asset'), '/caf%C3%A9/asset')
+        scope = {
+            'type': 'http', 'method': 'GET', 'path': '/caf\u00e9/asset x', 'root_path': '/outer space',
+            'raw_path': b'/caf%C3%A9/asset%20x', 'headers': [], 'query_string': b'a=1',
+        }
+        async def receive():
+            return {'type': 'http.disconnect'}
+        async def send(message):
+            pass
+
+        await app(scope, receive, send)
+        self.assertEqual(scope['path'], '/caf\u00e9/asset x')
+        self.assertEqual(received[0]['path'], '/outer space/caf\u00e9/asset x')
+        self.assertEqual(received[0]['raw_path'], b'/outer%20space/caf%C3%A9/asset%20x')
+        self.assertEqual(received[0]['root_path'], '/outer space/caf\u00e9')
+        self.assertEqual(received[0]['query_string'], b'a=1')
+
+    async def test_mount_names_do_not_shadow_route_urls(self):
+        async def endpoint(req):
+            return 'ok'
+
+        for name in ('child', 'child:route'):
+            app = Ryuuseigun('root')
+            app.add_url_rule('/route', endpoint, endpoint=name)
+            with self.assertRaisesRegex(ValueError, 'conflicts'):
+                app.mount('/child', Ryuuseigun('child'), name='child')
+
+            app = Ryuuseigun('root')
+            app.mount('/child', Ryuuseigun('child'), name='child')
+            with self.assertRaisesRegex(ValueError, 'conflicts'):
+                app.add_url_rule('/route', endpoint, endpoint=name)
+
     async def invoke(self, app, path, root_path=''):
         sent = []
 

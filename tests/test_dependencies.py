@@ -1,5 +1,5 @@
-from sys import executable
 from subprocess import run
+from sys import executable
 from unittest import TestCase
 
 class DependencyTests(TestCase):

@@ -9,16 +9,15 @@ from ryuuseigun.headers import Headers
 from inspect import iscoroutinefunction
 from ryuuseigun.metadata import RouteInfo
 from traceback import format_exception_only
-from ryuuseigun.types import ASGIApplication
 from ryuuseigun.exceptions import HTTPException
 from ryuuseigun._lifespan import LifespanSession
 from urllib.parse import quote, quote_from_bytes
 from ryuuseigun._registration import Registration
-from ryuuseigun.types import Send, Receive, ASGIScope
 from typing import Any, Optional, overload, TYPE_CHECKING
 from ryuuseigun.middleware import Next, MiddlewareCallable
 from contextlib import AsyncExitStack, AbstractAsyncContextManager
 from ryuuseigun._paths import route_path, mounted_scope, prefixed_path
+from ryuuseigun.types import Send, Receive, ASGIScope, ASGIApplication
 from collections.abc import Mapping, Callable, Iterable, Sequence, Awaitable
 from ryuuseigun.handlers import AfterHandler, BeforeHandler, validate_middleware
 from ryuuseigun.config import Config, MultipartOverrides, resolve_multipart_limits
@@ -125,7 +124,7 @@ class Ryuuseigun[
     """An ASGI application with explicitly owned state and resource lifetimes.
 
     Application state is created once per application instance. HTTP and socket
-    factories run once per connection, never share request state, and carry their
+    factories run once per HTTP request or WebSocket connection, and carry their
     types through registration. Register everything before finalize/startup.
     Resource contexts enter in registration order and unwind in reverse, including
     startup rollback. Request middleware owns sending and cleanup; after_request
@@ -268,6 +267,8 @@ class Ryuuseigun[
         prefix = path.rstrip('/')
         if not name or ':' in name or any(item.name == name or item.path == prefix for item in self._mounts):
             raise ValueError('Mount names and paths must be unique; names cannot contain a colon')
+        if any(endpoint.split(':', 1)[0] == name for endpoint in self._endpoints):
+            raise ValueError(f'Mount name conflicts with an HTTP endpoint: {name}')
         if not callable(app):
             raise TypeError('Mounted applications must be ASGI callables')
         if not isfinite(lifespan_timeout) or lifespan_timeout <= 0:
@@ -465,6 +466,7 @@ class Ryuuseigun[
             multipart=multipart,
             middlewares=tuple(middlewares),
         )
+        self._check_mount_endpoint(route.endpoint)
         existing_handler = self._endpoints.get(route.endpoint)
         if existing_handler is not None and existing_handler is not handler:
             raise ValueError(f'Duplicate endpoint: {route.endpoint}')
@@ -511,6 +513,7 @@ class Ryuuseigun[
         )
         endpoints: set[str] = set()
         for route in routes:
+            self._check_mount_endpoint(route.endpoint)
             if route.endpoint in self._endpoints or route.endpoint in endpoints:
                 raise ValueError(f'Duplicate endpoint: {route.endpoint}')
             endpoints.add(route.endpoint)
@@ -540,6 +543,10 @@ class Ryuuseigun[
             self._websocket_routes.append(websocket_route)
             self._websocket_endpoints[websocket_route.endpoint] = websocket_route.handler
         module._freeze()
+
+    def _check_mount_endpoint(self, endpoint: str) -> None:
+        if any(endpoint.split(':', 1)[0] == mount.name for mount in self._mounts):
+            raise ValueError(f'HTTP endpoint conflicts with a mount name: {endpoint}')
 
     def test_client(
         self, *, base_url: str = 'http://testserver', follow_redirects: bool = False,
