@@ -1,427 +1,191 @@
 # ☄️ Ryūseigun
 
-Ryuuseigun is a small async Python web framework built around ASGI. It covers the pieces most web apps need without bringing along a large stack: typed routes, JSON and form parsing, middleware, modules, streaming responses, WebSockets, and a test client.
+Ryuuseigun is a small async Python web framework for people who like building things their own way. It handles routing, requests, responses, middleware, streaming and WebSockets. You choose how the rest of your app works, including storage, authentication and rendering.
 
-The project is still young, so the API may move around before the first stable release. It is already a useful fit for small and medium sites where you want direct control over request handling and do not need a full application platform.
+Start with a single file, then split features into modules or mount separate ASGI apps as the project grows. The core only depends on `orjson`.
 
 ## Getting started
 
-Ryuuseigun requires Python 3.14 or newer. From a checkout, install it with the Granian server extra:
+You'll need Python 3.14 or newer. With a virtual environment active:
 
 ```console
-python -m pip install -e ".[server]"
+python -m pip install 'ryuuseigun[server]'
 ```
 
-Create an application:
+Save this as `app.py`:
 
 ```python
 from ryuuseigun import Request, Ryuuseigun
 
 app = Ryuuseigun(__name__)
 
-
 @app.get('/')
-async def home(request: Request) -> dict[str, str]:
-    return {'message': 'Hello from Ryuuseigun'}
+async def home(req: Request) -> dict[str, str]:
+    return {'message': 'Hello!'}
 
-
-@app.post('/echo')
-async def echo(request: Request) -> dict[str, object]:
-    return {'received': await request.json()}
+@app.get('/people/<int:person_id>')
+async def person(req: Request, person_id: int) -> dict[str, int]:
+    return {'id': person_id}
 ```
 
-Save that as `app.py`, then run it:
+Then run it:
 
 ```console
-granian --interface asgi app:app
+python -m granian --interface asgi app:app
 ```
 
-Ryuuseigun turns dictionaries and other JSON-compatible values into JSON responses. You can also return a `Response`, a `(body, status)` tuple, or one of the streaming and file response types.
+The server extra installs Granian. Any compatible ASGI server can serve the app.
 
-## Routing
+## Working with requests
 
-Every HTTP handler receives the request as its first positional argument, regardless of its name or annotation. Path parameters are passed by keyword after it. WebSocket handlers follow the same rule, with a socket first.
-
-Routes can include typed parameters. Ryuuseigun includes converters for strings, integers, floats, UUIDs, and paths:
+Handlers receive the request first, followed by path arguments. Routes support `str`, `int`, `float`, `uuid` and `path` converters. Dictionaries become JSON; you can also return text, bytes, `(body, status)` or a response object.
 
 ```python
-from uuid import UUID
-
-
-@app.get('/users/<int:user_id>')
-async def user(request: Request, user_id: int) -> dict[str, int]:
-    return {'id': user_id}
-
-
-@app.get('/objects/<uuid:object_id>')
-async def object_details(request: Request, object_id: UUID) -> dict[str, str]:
-    return {'id': str(object_id)}
-```
-
-Give a route a name when you want to build links without repeating its path:
-
-```python
-from ryuuseigun import url_for
-
-
-@app.get('/people/<int:person_id>', name='person')
-async def person(request: Request, person_id: int) -> dict[str, int]:
-    return {'id': person_id}
-
-
-@app.get('/people-link')
-async def person_link(request: Request) -> dict[str, str]:
-    return {'href': url_for('person', person_id=42)}
-```
-
-`app.url_for(...)`, `request.url_for(...)`, and the context-aware `url_for(...)` helper all use the same route names.
-
-## Requests and forms
-
-The request object gives you headers, cookies, query parameters, path parameters, client information, and the request body in a few useful forms:
-
-```python
-@app.get('/search')
-async def search(request: Request) -> dict[str, object]:
-    return {
-        'query': request.args.get('q', ''),
-        'tags': request.args.getlist('tag'),
-    }
-
+@app.post('/echo')
+async def echo(req: Request):
+    return {'received': await req.json()}
 
 @app.post('/profile')
-async def profile(request: Request) -> dict[str, object]:
-    form = await request.form()
-    return {'display_name': form.get('display_name')}
+async def profile(req: Request):
+    form = await req.form()
+    return {'name': form.get('name')}
 ```
 
-`request.body()`, `request.text()`, `request.json()`, and `request.form()` collect and cache their result. For large bodies, `request.stream()` lets you handle incoming chunks directly.
+Headers, cookies and query parameters are available on `req.headers`, `req.cookies` and `req.query`. Body helpers cache their results. Use `req.stream()` for incoming chunks or `req.multipart()` to stream uploaded parts directly. `req.form()` gives you `UploadFile` objects backed by spooled temporary files.
 
-## Streaming file uploads
+Use `Config` to set body, query and multipart limits, trusted hosts, slash behavior and default response headers. Route-level `MultipartOverrides` can adjust individual upload limits.
 
-Multipart uploads can be streamed straight to an object store or another destination. The file never needs to be collected into one large in-memory value:
+Responses include `JSONResponse`, `FileResponse`, `StreamingResponse` and `EventStreamResponse`. `Response.set_cookie()`, `delete_cookie()` and `redirect()` cover common HTTP chores. See [the HTTP examples](examples/modern_http.py) for conditional requests, compression, ranges and server-sent events.
 
-```python
-@app.post('/assets')
-async def upload_assets(request: Request) -> dict[str, int]:
-    uploaded = 0
+## Middleware and resources
 
-    async for part in request.multipart():
-        if part.filename:
-            await object_store.upload(part.filename, part.stream())
-            uploaded += 1
-
-    return {'uploaded': uploaded}
-```
-
-Calling `request.form()` instead gives you `UploadFile` objects backed by spooled temporary files. Small files stay in memory and larger files roll over to disk. This is convenient when code needs to seek or reread an upload, while direct multipart streaming is usually the better choice for large files.
-
-Disk writes run in worker threads and are batched with up to 320 KiB of additional buffering per active file. Cancellation waits for an outstanding write before closing the file.
-
-Multipart limits are configurable without affecting applications that never parse multipart bodies:
+Middleware stays active through response sending and request cleanup, including streamed responses:
 
 ```python
-from ryuuseigun import Config
-
-app = Ryuuseigun(
-    __name__,
-    config=Config(
-        max_request_body_size=64 * 1024**2,
-        max_multipart_parts=100,
-        max_multipart_field_size=1024**2,
-        max_multipart_file_size=32 * 1024**2,
-    ),
-)
-```
-
-A route can inherit those defaults or override just the limits it needs:
-
-```python
-from ryuuseigun import MultipartOverrides
-
-@app.post(
-    '/videos',
-    multipart=MultipartOverrides(max_parts=5, max_file_size=2 * 1024**3),
-)
-async def upload_video(request: Request) -> dict[str, bool]:
-    async for part in request.multipart():
-        if part.filename:
-            await object_store.upload(part.filename, part.stream())
-    return {'ok': True}
-```
-
-Omitted `MultipartOverrides` fields inherit application limits. An explicit `None` disables only that limit. Route options accept `MultipartOverrides`; `MultipartLimits` describes fully resolved limits and is not a route override. The whole-request body limit still applies unless `max_request_body_size` is also `None`.
-
-## Middleware and hooks
-
-Middleware wraps handler execution, response sending, and request cleanup. Use `try/finally` or an async context manager to keep resources alive through a streamed response:
-
-```python
-from ryuuseigun import Next, Response
+from time import perf_counter
+from ryuuseigun import Next
 
 @app.middleware
-async def database(request: Request, next: Next) -> None:
-    async with pool.connection() as connection:
-        request.state.connection = connection
-        await next(request)
+async def timing(req: Request, next: Next) -> None:
+    started = perf_counter()
+    try:
+        await next(req)
+    finally:
+        app.logger.info('%s took %.3fs', req.path, perf_counter() - started)
 ```
 
-`next(request)` returns `None` after the response has been sent and request uploads have been closed. To stop a request early, await `request.respond(...)` and return:
+Call `await next(req)` to continue or `await req.respond(...)` to respond directly. Middleware returns `None`. Ordinary handler decorators can implement things like authentication; put the routing decorator outermost and preserve `functools.wraps`.
 
-```python
-async def require_api_key(request: Request, next: Next) -> None:
-    if request.headers.get('X-API-Key') != 'example-key':
-        await request.respond(Response('Invalid API key', 401))
-        return
-    await next(request)
+| Hook | Useful for | Lifetime |
+| --- | --- | --- |
+| Handler decorator | Authentication, per-route policy | Until the handler returns |
+| `before_request` | Request setup or an early response | Before the handler |
+| `after_request` | Changing headers or the response | Before sending |
+| Middleware | Resource scopes and timing | Through sending and cleanup |
+| `lifespan` | Database connections and shared clients | Startup through shutdown |
 
-@app.get('/private', middlewares=(require_api_key,))
-async def private(request: Request) -> dict[str, bool]:
-    return {'authenticated': True}
-```
+Application middleware enters before module middleware. Before hooks run from outer scopes inward; after hooks run in reverse. An async context manager registered with `@app.lifespan` opens at startup and closes at shutdown. Contexts unwind in reverse order, including when startup fails. Keep resources used by a stream in middleware or the generator's own context.
 
-The `middlewares` tuple runs in declaration order and works on application, module, and WebSocket route decorators. Use `after_request` to change headers or replace a response before sending starts:
+State can be typed at all three levels: `Ryuuseigun[RequestState, AppState, SocketState]`. Supply `request_state_factory`, `app_state_factory` and `websocket_state_factory` for the classes you use. Application state is created once per app; request state is fresh for each HTTP request, and socket state for each WebSocket connection. The defaults are independent `SimpleNamespace` instances.
 
-```python
-@app.after_request
-async def identify(request: Request, response: Response) -> Response:
-    response.headers['X-Service'] = 'example'
-    return response
-```
+[The composition example](examples/composition.py) shows typed state, reusable modules and services passed in as ordinary Python arguments. [The lifecycle trace](examples/lifecycle_trace.py) shows the order of hooks, errors and cleanup. Response `after_send` callbacks run in the serving process after a successful send; use your own job system for work that needs durable delivery.
 
-Hooks have fixed positional signatures: `before_request(request)`, `after_request(request, response)`, and `errorhandler(request, error)`. Before hooks return `None` to continue or a response value to stop. After and error hooks return a response value. Typed applications and modules check the request state type on routes, middleware, and hooks.
+## Modules and ASGI apps
 
-Application middleware enters first, followed by application before hooks, then each module's middleware and before hooks, then route middleware and the handler. After hooks run from the innermost entered scope outward, in reverse registration order. Sending and cleanup finish before middleware unwinds. A scope's middleware can reject a request before that scope's hooks run. Application errors after response headers have been sent propagate without attempting another response.
-
-For public services, the optional concurrency limiter can reject excess work cleanly instead of letting an application queue grow without bound:
-
-```python
-from ryuuseigun import ConcurrencyLimit
-
-app.middleware(ConcurrencyLimit(500, retry_after=1))
-```
-
-Rejected requests receive `503 Service Unavailable` and a `Retry-After` header. Capacity stays reserved through response sending and request cleanup, including streaming and file downloads. The limiter can also be attached to selected routes with `@app.get('/download', middlewares=(ConcurrencyLimit(10),))`.
-
-## Modules
-
-Modules group related routes and can carry their own middleware, hooks, and error handlers:
+Modules group routes, middleware and hooks inside an application:
 
 ```python
 from ryuuseigun import Module
 
 api = Module('api', url_prefix='/api')
 
+@api.get('/ping')
+async def ping(req: Request):
+    return {'pong': True}
 
-@api.get('/status', name='status')
-async def status(request: Request) -> dict[str, bool]:
-    return {'ready': True}
-
-
-app.register_module(api, url_prefix='/v1')
+app.register_module(api)
 ```
 
-That route is available at `/v1/api/status` and can be reversed with `app.url_for('api.status')`.
+Mount an independent ASGI app with `app.mount('/admin', admin_app, name='admin')`. Add `lifespan=True` when the parent should start and stop that child. The longest matching mount owns its prefix, before native routes are considered. Each mounted app owns its hooks and configuration. For a policy that covers the whole site, wrap the outer ASGI app, as in [the CORS example](examples/cors.py).
 
-Modules can be nested, which is handy when a larger app has separate areas with their own behavior. Registering a module freezes it and its children.
+`app.url_for('api.ping')` builds a module route. `app.url_for('admin:dashboard')` calls a mounted app's URL builder; `app.url_for('admin', path='/assets/icon.svg')` works with any ASGI app. Mount names reserve their URL namespace. Inside a handler, `req.url_for(...)` and the context-aware `url_for(...)` helper include the external `root_path`, including nested mounts. `req.path` is relative to the current app.
 
-Applications finalize on lifespan startup or the first HTTP or WebSocket request. You can also call `app.finalize()` explicitly. Finalization compiles route pipelines once and rejects later route, middleware, hook, module, and lifecycle registration. Finish registration before starting the server or making test requests. Configuration and public registration collections are read-only; shared runtime resources belong in `app.state`.
+## Inspecting and extending an app
 
-## Streaming, files, and WebSockets
+Finish registration before serving requests. `app.finalize()` freezes it explicitly; startup and the first request also finalize it. Synchronous `app.on_finalize(callback)` hooks let integrations finish setup before that happens. Callbacks that fail may be retried, so keep them idempotent.
 
-Ryuuseigun includes:
-
-- `StreamingResponse` for async response bodies
-- `FileResponse` with range and conditional request support
-- `EventStreamResponse` for server-sent events
-- `WebSocket` routes with JSON, text, and binary helpers
-- optional gzip, Brotli, and Zstandard response compression
-
-Streaming responses keep listening for client disconnects. Any unread request body is buffered for later consumption, using `upload_spool_threshold` to spill to a temporary file. The request body size limit still applies, and temporary files are closed during request cleanup.
-
-Compression is an after-request hook:
-
-```python
-from ryuuseigun import Compression
-
-app.after_request(Compression())
-```
-
-Streaming compression runs in worker threads. Brotli streams use quality 4 to keep response latency low; buffered Brotli responses retain the codec's default quality.
-
-Brotli support uses the optional compression extra:
+`req.route` and `socket.route` expose immutable `RouteInfo` with the route template, endpoint, methods, module names and middleware names. Unmatched requests have no route. `app.inspect_routes()` finalizes and lists native HTTP and WebSocket routes; `app.mounts` lists separate applications.
 
 ```console
-python -m pip install -e ".[server,compression]"
+python -m ryuuseigun inspect examples.basic:app
+python -m ryuuseigun inspect examples.composition:app --json
 ```
 
-See `examples/modern_http.py` for streaming responses, server-sent events, file responses, lifespan resources, and WebSockets in one application.
+The command imports the application and shows its routes and mounts without starting lifespan resources. Inspect a child application separately for its own routes. Extensions can use the public registration methods, middleware types, `RouteInfo` and the `ASGIApplication` callable type without depending on dispatch internals.
 
 ## Testing
 
-The built-in client calls the ASGI application directly, so ordinary request tests do not need a live server:
+The built-in client supports JSON, forms, multipart files, cookies, redirects and WebSockets:
 
 ```python
-from unittest import IsolatedAsyncioTestCase
-
-
-class AppTests(IsolatedAsyncioTestCase):
-    async def test_home(self) -> None:
-        response = await app.test_client().get('/')
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {'message': 'Hello from Ryuuseigun'})
+async def test_home():
+    async with app.test_client() as client:
+        response = await client.get('/')
+        assert response.json() == {'message': 'Hello!'}
 ```
 
-Run the project checks with:
+The context manager starts and stops lifespan. For an app wrapped in third-party middleware, use `TestClient(application)` from `ryuuseigun.testing`. Pass `root_path='/prefix'` to test a deployment prefix.
 
-```console
-python -m unittest discover -s tests
-python -m ruff check ryuuseigun tests examples benchmarks
-python -m mypy ryuuseigun examples tests/typing_contracts.py
-```
+Use `async with client.stream('GET', '/events') as response` and iterate `response.iter_bytes()` to test a stream as it arrives. The transport holds one outgoing ASGI message at a time and waits for the consumer. Leaving the context disconnects and waits for cleanup; `response.disconnect()` can trigger that explicitly. Async iterables also work as upload bodies. Streaming requests have a configurable timeout and do not follow redirects.
 
-Run the in-process ASGI benchmarks with `python -m benchmarks.hotpaths`. They check response status and bodies before timing static and dynamic routes, middleware, headers, JSON bodies, streaming, and multipart uploads. Use `--rounds 9 --iterations 6000` for longer runs or `--only static_json dynamic_json` to select workloads. These timings exclude network and server overhead.
+[This runnable example](examples/testing_streams.py) tests an open-ended stream through CORS middleware and checks disconnect cleanup.
 
-Use `python -m benchmarks.middleware` to measure ordinary decorators, middleware, nested hooks, and WebSocket dispatch separately. Add `--finalize-routes 1000` to measure pipeline finalization time and allocations for an application with 1,000 routes.
+## More examples
 
-The `examples` directory has smaller focused applications for routing, modules, middleware, typed request state, and newer HTTP features.
+The [examples directory](examples) has small apps for [routing](examples/basic.py), [modules](examples/modules.py), [middleware](examples/middleware.py), [typed request state](examples/typed_request_state.py) and [HTTP features](examples/modern_http.py).
 
-## Migrating earlier checkouts
+The [gallery](examples/gallery/app.py) puts several pieces together: a factory, typed state, cookie sessions, CSRF checks, rate limits, uploads and persistent SQLite storage through [sqrrl](https://pypi.org/project/sqrrl/). Input checks are ordinary Python in the handlers.
 
-See the developer experience sections below for the current test client and optional integrations.
-
-- Reinstall the checkout with `python -m pip install -e .`, use `ryuuseigun` for package imports, and create applications with `Ryuuseigun(...)`.
-- Add a first request argument to every HTTP route and hook; add a first socket argument to every WebSocket route. Names and annotations no longer select argument injection.
-- Change middleware to await `next(request)` and return `None`. Use `request.respond(...)` for early responses and `after_request` for response changes. Register `Compression()` with `app.after_request(...)`.
-- Replace `@use(...)` and `@use_websocket(...)` with `middlewares=(...)` on the route decorator.
-- Replace route multipart dictionaries and `MultipartLimits(...)` with `MultipartOverrides(...)`. Omitted fields inherit; explicit `None` means unlimited.
-- Complete registration before startup or the first request. To change a finalized application's routes or hooks, construct a new application.
-
-## Diagnosing failures
-
-`app.logger` is a standard Python logger named `ryuuseigun.<import_name>`. Ryuuseigun logs tracebacks for unexpected HTTP and WebSocket errors it handles, and for lifespan failures. Configure logging in your application with `logging.basicConfig()` or your normal logging configuration. Expected HTTP errors, disconnects, and handled application exceptions do not produce automatic error logs.
-
-`Config(debug=True)` adds a debug-level registration summary and route-pattern context to HTTP error records. Client error details still require `expose_error_details=True`. `propagate_exceptions=True` passes unexpected exceptions to your server or test runner, which owns reporting them. Errors after response headers have been sent also propagate; Ryuuseigun cannot replace an already-started response. Request bodies, cookies, authorization headers, and query strings are not added to automatic log metadata. Application exception messages can contain whatever the application puts in them.
-
-## Testing application resources and HTTP flows
-
-Use an async client context when startup creates resources. It drives the real ASGI lifespan on the test's event loop and runs shutdown even if an assertion fails:
-
-```python
-async def test_application() -> None:
-    async with app.test_client(base_url='https://testserver') as client:
-        login = await client.post('/login', json={'username': 'demo', 'password': 'test-password'}, follow_redirects=True)
-        assert login.status_code == 200
-        assert login.history[0].status_code == 303
-```
-
-The one-shot `await app.test_client().get('/')` form deliberately skips lifespan. A client context can be entered once; overlapping lifespan contexts for the same app are rejected. Concurrent requests inside one context are supported. Prefer fresh application factories for independent tests. `lifespan_timeout=10` controls the startup/shutdown handshake timeout. Exceptions are controlled by the application's `Config(propagate_exceptions=True)`, without mutating config for individual clients.
-
-The client maintains cookies with domain, path, expiry, and secure transport rules. Use an HTTPS `base_url` when testing secure cookies. Redirects default to disabled, can be enabled per request or client, and are capped by `max_redirects=20`. External-origin requests and redirects raise `ValueError`; this transport never makes network requests. A redirect response's predecessors appear in `response.history`, and `response.url` identifies the final URL.
-
-Use `form={'name': 'value'}` for URL-encoded data and `files={'document': ('notes.txt', b'hello', 'text/plain')}` for uploads. Combine `form` and `files` for multipart requests. Lists of `(name, value)` pairs preserve repeated fields and files. Choose one of `body`, `json`, or `form/files`; conflicting encodings fail before dispatch. Multipart boundaries are generated by the client. Responses remain buffered, so use direct ASGI tests for incremental streaming or disconnect behavior.
-
-## Cookies and redirects
-
-```python
-from ryuuseigun import Response, redirect
-
-def signed_in(session_token: str) -> Response:
-    res = redirect('/account', status_code=303)
-    res.set_cookie('session', session_token, max_age=3600, secure=True, httponly=True)
-    return res
-
-def signed_out() -> Response:
-    res = redirect('/login', status_code=303)
-    res.delete_cookie('session', path='/')
-    return res
-```
-
-Cookies default to `path='/'`, `samesite='lax'`, `secure=False`, and `httponly=False`. Each call appends a separate `Set-Cookie` header. `expires` takes a timezone-aware datetime. Deletion must match the original name, path, and domain; pass `secure=True` when deleting prefixed secure cookies. `SameSite=None` requires `secure=True`, and `__Host-`/`__Secure-` requirements are validated. Applications own session storage, revocation, CSRF protection, and redirect destination policy.
-
-`redirect()` defaults to 302 and supports 301, 302, 303, 307, and 308. Use 303 for navigation after a successful POST; 307 and 308 preserve the request method and body.
-
-## Choosing a decorator or lifecycle callback
-
-| Mechanism | Use it for | When it finishes |
-| --- | --- | --- |
-| Ordinary async decorator | Authentication, permissions, route-specific rate limits | When the handler returns. |
-| `before_request` | Shared checks and request state | Before the handler; a response stops further processing. |
-| `after_request` | Headers and response changes | Before sending the response. |
-| Middleware | Resource scopes, concurrency, end-to-end timing | After downstream sending and cleanup. |
-| `lifespan` | Pools and shared clients | Application shutdown. |
-
-Keep the routing decorator outermost, preserve `functools.wraps`, and await the wrapped handler. Authentication above a rate-limit decorator runs first, allowing the limit to use authenticated identity. Reversing those decorators charges rejected authentication attempts too.
-
-`examples/gallery/auth.py` and `examples/gallery/rate_limits.py` show typed decorator factories that preserve path arguments and return types. `examples/lifecycle_trace.py` provides an executable trace through nested modules, early responses, errors, and streaming. A decorator's `finally` runs before a returned stream is consumed. Put a resource needed by the stream in middleware or in the generator's own context.
-
-## Optional validation and API schemas
-
-Install optional integrations in the project virtual environment:
+From a checkout, with its virtual environment active, run the local HTTP demo in PowerShell:
 
 ```powershell
-& .\.venv\Scripts\python.exe -m pip install -e '.[validation]'
-```
-
-`ryuuseigun.validation` provides `parse_json(req, Model)`, `parse_query(req, Model)`, and `install_validation(app)`. Install the error handler when using those helpers on their own. Model errors become structured 422 responses with raw inputs and exception context omitted. Malformed JSON remains 400; `parse_json` requires `application/json` and otherwise returns 415. Pydantic model configuration controls coercion and extra-field behavior. Custom validation messages remain application-controlled.
-
-`ryuuseigun.openapi.OpenAPI` installs validation error handling and adds `/openapi.json` and a small dependency-free schema viewer at `/docs`. Set `docs_url=None` to omit the viewer. This adapter uses explicit models:
-
-```python
-from pydantic import BaseModel
-from ryuuseigun.openapi import OpenAPI
-from ryuuseigun.validation import parse_json
-from ryuuseigun import Request, Ryuuseigun, JSONResponse
-
-class CreateItem(BaseModel):
-    title: str
-
-class Item(BaseModel):
-    id: int
-    title: str
-
-app = Ryuuseigun(__name__)
-api = OpenAPI(app, title='Items', version='1')
-
-@app.post('/items')
-@api.schema(body=CreateItem, responses={201: Item})
-async def create_item(req: Request) -> JSONResponse:
-    item = await parse_json(req, CreateItem)
-    return JSONResponse({'id': 1, 'title': item.title}, status_code=201)
-```
-
-The schema decorator validates declared JSON/query input before calling the handler and caches validated models on that request. It validates modeled response bodies strictly and preserves the handler's return value. Use `None` for a status whose payload is not modeled. Undeclared returned statuses and invalid modeled responses are application errors. Hooks and outer decorators can still return other responses; declare their expected errors explicitly.
-
-OpenAPI 3.1.1 documents are generated at finalization and cached, with no per-request schema inspection. Module paths, path converters, declared responses, scalar query models, and explicit security schemes are supported. `api.document()` returns a defensive copy. Query models currently support required/defaulted string, integer, number, and boolean fields. Authentication declarations describe your own authentication decorators; they do not implement authentication. Routes without schema metadata are omitted. Keep uploads, streaming payloads, custom media types, WebSockets, and QUERY routes outside this initial adapter. `functools.wraps` preserves schema metadata through ordinary wrappers.
-
-Applications using only the core do not import Pydantic or SQLAlchemy. For integrations needing finalization, `app.routes` exposes a read-only route tuple and `app.on_finalize(callback)` registers synchronous setup before pipelines are frozen. Register routes first, make setup callbacks idempotent if they can fail, and complete registration before serving requests.
-
-## Gallery and middleware integration examples
-
-`examples/gallery` combines an application factory, typed state, module hooks, cookie authentication, CSRF checks, rate-limit decorators, SQLite through SQLAlchemy asyncio, bounded multipart uploads, downloads, request IDs/logging, and OpenAPI. Transactions commit before successful responses; the engine closes at shutdown. The example uses one configured demo identity. Sessions and image records persist in SQLite; rate limits are process-local. Replace the demo identity check and the process-local limiter when adapting it to a multi-user or multi-worker service. Uploads are treated as opaque bytes and downloaded as attachments.
-
-For a local HTTP demonstration:
-
-```powershell
-& .\.venv\Scripts\python.exe -m pip install -e '.[server,examples,integration-tests]'
+python -m pip install -e '.[server,examples]'
 $env:GALLERY_PASSWORD = 'replace-for-local-testing'
 $env:GALLERY_ORIGIN = 'http://127.0.0.1:8000'
 $env:GALLERY_INSECURE_LOCAL_COOKIES = '1'
-& .\.venv\Scripts\granian.exe --interface asgi --host 127.0.0.1 --port 8000 examples.gallery_server:app
+python -m granian --interface asgi examples.gallery_server:app
 ```
 
-The default database is `gallery.db`; override it with `GALLERY_DATABASE_URL`. POST JSON credentials to `/login`, follow the redirect to `/account`, and use its `csrf_token` in `X-CSRF-Token` for later writes. POST `{"title":"Example"}` to `/api/images`, upload the `image` file field to `/api/images/<id>/content`, and GET that same URL to download. `/api/images?limit=20` lists records. `/logout` revokes the session. The one-MiB request limit includes multipart overhead.
+The demo applies its checked-in migrations at startup and closes the database at shutdown. It uses `gallery.db`, or the path in `GALLERY_DATABASE_PATH`. Start with a fresh demo database when moving from the old gallery. For several workers, run migrations before starting them, and replace the process-local rate limiter with a shared one.
 
-`examples/cors.py` shows Starlette's optional `CORSMiddleware` around the complete ASGI application, including generated error responses and preflight requests. Serve `examples.cors:application`. Its explicit origin allowlist is separate from authentication and CSRF checks. Framework ASGI annotations accept mutable mappings, matching common ASGI middleware without conversion wrappers.
+POST `{"username":"demo","password":"..."}` to `/login`, follow the redirect to `/account`, then send its `csrf_token` as `X-CSRF-Token` for writes. POST `{"title":"Example"}` to `/api/images`. PUT a multipart `image` file to `/api/images/<id>/content`, then GET that path to download it. This example has one configured demo identity.
 
-Run the optional integration tests after installing the extras:
+After changing the gallery schema, regenerate the sqrrl models and create a migration. CI checks both the generated code and migration history.
 
-```powershell
-& .\.venv\Scripts\python.exe -m unittest discover -s tests\integrations -q
-& .\.venv\Scripts\mypy.exe ryuuseigun examples tests\typing_contracts.py tests\integrations\optional_typing_contracts.py
+## Compatibility and development
+
+Python 3.14 is the supported baseline, including standard-library Zstandard support. CI checks Linux, Windows and macOS, runs real Granian requests, and tests the built wheel outside the checkout. Examples and features on `master` can be ahead of the latest PyPI release.
+
+Public APIs are the documented classes, functions, methods and typing contracts. Names starting with `_` are internal. Patch releases aim to preserve public behavior; before 1.0, minor releases may make documented breaking changes. Check the [release notes](https://github.com/depthbomb/ryuuseigun/releases) when upgrading.
+
+Changes since 0.9.0: mounted ASGI apps and prefix-aware URLs, public route inspection, typed app and socket state, and streaming tests. The OpenAPI and Pydantic adapters and the `validation` extra have been removed. The gallery now uses sqrrl and `GALLERY_DATABASE_PATH`.
+
+```console
+python -m pip install -e '.[dev,server,compression,examples]'
+python -m ruff check ryuuseigun tests examples benchmarks
+python -m mypy ryuuseigun examples tests/typing_contracts.py tests/integrations/optional_typing_contracts.py
+python -m sqrrl generate --check --config examples/gallery/sqrrl.json
+python -m sqrrl migrate check --config examples/gallery/sqrrl.json
+python -m pytest tests --cov=ryuuseigun --cov-branch
+python -m build
+python -m twine check --strict dist/*
 ```
 
-Core tests remain under `tests`. The integration suite is separate so core-only installations need no database, validation, schema-validator, or third-party middleware packages. Python 3.14+ remains required, and this early version's public APIs are still subject to change.
+For local HTTP comparisons with Starlette and Quart:
 
-`python -m benchmarks.dx --optional` measures response helpers, form/upload encoding, the richer test client, and optional model validation/schema serving. Client timings include its transport and cookie handling; compare server dispatch with `benchmarks.middleware` separately.
+```console
+python -m pip install -e '.[benchmark]'
+python -m benchmarks.server --requests 5000 --rounds 3 --concurrency 16
+```
+
+The runner checks JSON, streaming and upload responses using the same Granian settings. It reports throughput, p50/p95/p99 latency, CPU time, sampled RSS and environment details. Use `--output /path/outside/the/checkout/results.json` to keep a report. These are closed-loop tests sharing one machine with the client, so treat them as local comparisons. Smaller in-process benchmarks remain in [benchmarks](benchmarks).

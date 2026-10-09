@@ -17,8 +17,8 @@ Exceptions after headers are sent propagate, since another response is impossibl
 Mounted apps are separate hook boundaries. Wrap the whole ASGI application for
 cross-cutting policies such as CORS. All state below is local to this process.
 """
-from types import SimpleNamespace
 from dataclasses import dataclass
+from types import SimpleNamespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from ryuuseigun import Next, Module, Request, WebSocket, Ryuuseigun
