@@ -164,7 +164,9 @@ After changing the gallery schema, regenerate the sqrrl models and create a migr
 
 ## Compatibility and development
 
-Python 3.14 is the supported baseline, including standard-library Zstandard support. CI checks Linux, Windows and macOS, runs real Granian requests, and tests the built wheel outside the checkout. Examples and features on `master` can be ahead of the latest PyPI release.
+Python 3.14 and 3.15 are supported, with 3.14 as the minimum, including standard-library Zstandard support. CI checks both versions on Linux, Windows and macOS, runs real Granian requests, and tests the built wheel outside the checkout. Examples and features on `master` can be ahead of the latest PyPI release.
+
+The optional `compression` extra adds Brotli support. Brotli currently builds from source on Python 3.15 and requires a C/C++ build toolchain. Gzip and Zstandard use the standard library.
 
 Public APIs are the documented classes, functions, methods and typing contracts. Names starting with `_` are internal. Patch releases aim to preserve public behavior; before 1.0, minor releases may make documented breaking changes. Check the [release notes](https://github.com/depthbomb/ryuuseigun/releases) when upgrading.
 
