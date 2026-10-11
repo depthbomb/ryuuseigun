@@ -183,6 +183,14 @@ python -m build
 python -m twine check --strict dist/*
 ```
 
+For benchmarks of buffered request bodies and multipart reads:
+
+```console
+python -m benchmarks.body --output /path/outside/the/checkout/body-results.json
+```
+
+The runner checks the received bytes and reports request latency and peak traced allocations for empty through 8 MiB payloads. It uses prebuilt input chunks and the in-process ASGI pipeline. Allocation tracing runs separately from timing, and excludes the input buffers. Use the same interpreter and settings when comparing changes.
+
 For local HTTP comparisons with Starlette and Quart:
 
 ```console

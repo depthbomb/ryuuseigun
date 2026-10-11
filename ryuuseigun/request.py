@@ -26,6 +26,9 @@ from ryuuseigun.constants import MediaType, HeaderName, StatusCode, ASGIMessageT
 if TYPE_CHECKING:
     from ryuuseigun.response import Response, ResponseValue
 
+# These buffers are discarded after conversion; Python 3.15 can transfer their storage.
+_take_bytes: Callable[[bytearray], bytes] = getattr(bytearray, 'take_bytes', bytes)
+
 class _MultipartHeaderRegistry(HeaderRegistry):
     def __init__(self) -> None:
         super().__init__()
@@ -327,7 +330,7 @@ class MultipartPart:
         data = bytearray()
         async for chunk in self.stream():
             data.extend(chunk)
-        return bytes(data)
+        return _take_bytes(data)
 
     async def text(self, encoding: Optional[str] = None) -> str:
         try:
@@ -855,7 +858,7 @@ class Request[StateT = SimpleNamespace]:
         async for chunk in self.stream():
             chunks.extend(chunk)
 
-        self._body = bytes(chunks)
+        self._body = _take_bytes(chunks)
         return self._body
 
     def _validate_content_length(self) -> None:
